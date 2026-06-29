@@ -1,18 +1,24 @@
-# voiceCommandToRobot
-# Skill — turn voice / text into robot commands.
-# Works offline (OpenAI Whisper runs locally; model downloaded on first use).
+# voiceCommandRobot / voiceCommandToRobot
+# Two agent skills: mic -> WAV -> offline Whisper -> text file.
+# OpenAI Whisper model is downloaded on first use.
 
 openai-whisper>=20231117
 torch>=2.0.0
-pyaudio>=0.2.11
-webrtcvad>=2.0.10
+sounddevice>=0.4.0
+soundfile>=0.12.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# Optional (used by voiceCommandToRobot for voice-activity detection):
+# pyaudio>=0.2.11
+# webrtcvad>=2.0.10
 
 # Optional (improves Whisper speed):
 # ffmpeg-python
 
 # -------- Notes for installation --------
 # Ubuntu/debian system prerequisites (run once):
-#   sudo apt-get install -y portaudio19-dev ffmpeg
+#   sudo apt-get install -y ffmpeg
 #
 # Then inside a Python 3.10+ venv:
 #   python3 -m venv .venv
