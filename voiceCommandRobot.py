@@ -1,30 +1,14 @@
 #!/usr/bin/env python3
 """
-voiceCommandRobot
-------------------
-An agent skill that simulates a robot receiving voice from the microphone
-and using off-line OpenAI Whisper to transcribe it into text.
-
-Design (two simple parts):
-  Part 1 — Get voice from the microphone and save it as a WAV file.
-  Part 2 — Use Whisper offline ASR to transcribe the WAV into text,
-           then write the transcription to a text file.
-
-Usage:
-  python3 voiceCommandRobot.py                   # one-shot: record + transcribe
-  python3 voiceCommandRobot.py --loop           # continuous loop (Ctrl+C to stop)
-  python3 voiceCommandRobot.py --loop --max 5   # loop 5 times then stop
-  python3 voiceCommandRobot.py --model tiny      # choose Whisper model size
-  python3 voiceCommandRobot.py --duration 5      # record for N seconds
-  python3 voiceCommandRobot.py --language zh     # hint language to Whisper
-  python3 voiceCommandRobot.py --backend alsa   # force ALSA backend (RK3588)
-  python3 voiceCommandRobot.py --list-devices   # show available microphones
-  python3 voiceCommandRobot.py --optimize       # optimize for speed
+voiceCommandRobot - STREAMING Voice Transcription
+---------------------------------------------------
+A robot voice command tool that:
+  - Captures audio from microphone continuously
+  - Transcribes speech to text using Faster-Whisper (offline)
+  - Appends transcriptions to a text file
+  - Stops ONLY when you press Ctrl+C
 """
 
-import argparse
-import datetime
-import json
 import os
 import sys
 import datetime
@@ -78,9 +62,11 @@ class VoiceRobot:
         output_file: str = "robot_transcripts.txt",
         device: int = None,
         language: str = "zh",
-        chunk_duration: float = 2.0,
+        chunk_duration: float = 0.5,
         sample_rate: int = 16000,
         enable_commands: bool = False,
+        min_audio_duration: float = 0.2,
+        audio_threshold: float = 0.01,
     ):
         self.model_name = model_name
         self.model_dir = model_dir
@@ -90,6 +76,8 @@ class VoiceRobot:
         self.chunk_duration = chunk_duration
         self.sample_rate = sample_rate
         self.enable_commands = enable_commands
+        self.min_audio_duration = min_audio_duration
+        self.audio_threshold = audio_threshold
         
         self._model = None
         self._audio_queue = queue.Queue()
@@ -144,13 +132,14 @@ class VoiceRobot:
         import sounddevice as sd
         print(f"[Audio] Capturing at {self.sample_rate} Hz... Press Ctrl+C to stop")
         try:
+            blocksize = int(self.sample_rate * self.chunk_duration)
             with sd.InputStream(
                 samplerate=self.sample_rate,
                 channels=1,
                 dtype='int16',
                 device=self.device,
                 callback=self._audio_callback,
-                blocksize=int(self.sample_rate * self.chunk_duration)
+                blocksize=blocksize
             ):
                 while self._running:
                     time.sleep(0.1)
@@ -160,23 +149,34 @@ class VoiceRobot:
 
     def _transcribe_loop(self):
         self._load_model()
-        buffer = deque(maxlen=int(self.sample_rate * 10))
+        buffer = deque(maxlen=int(self.sample_rate * 3))
         
         while self._running:
             try:
-                chunk = self._audio_queue.get(timeout=0.5)
+                chunk = self._audio_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             
             chunk_float = chunk.astype(np.float32) / 32768.0
             buffer.extend(chunk_float.flatten())
             
-            if len(buffer) >= int(self.sample_rate * self.chunk_duration):
+            min_samples = int(self.sample_rate * self.min_audio_duration)
+            if len(buffer) >= min_samples:
                 audio_np = np.array(buffer, dtype=np.float32)
                 
-                kwargs = {}
-                if self.language:
-                    kwargs["language"] = self.language
+                rms = np.sqrt(np.mean(audio_np ** 2))
+                if rms < self.audio_threshold:
+                    buffer.clear()
+                    continue
+                
+                kwargs = {
+                    "language": self.language,
+                    "beam_size": 1,
+                    "best_of": 1,
+                    "temperature": 0.0,
+                    "condition_on_previous_text": False,
+                    "word_timestamps": False,
+                }
                 
                 segments, _ = self._model.transcribe(audio_np, **kwargs)
                 text = "".join([s.text for s in segments]).strip()
@@ -239,8 +239,12 @@ def parse_args():
                    help="List audio devices")
     p.add_argument("--language", default="zh",
                    help="Language hint (zh, en, etc.)")
-    p.add_argument("--chunk-duration", type=float, default=2.0,
-                   help="Audio chunk duration in seconds")
+    p.add_argument("--chunk-duration", type=float, default=0.5,
+                   help="Audio chunk duration in seconds (default: 0.5 for low latency)")
+    p.add_argument("--min-audio", type=float, default=0.2,
+                   help="Minimum audio duration before transcription (default: 0.2)")
+    p.add_argument("--threshold", type=float, default=0.01,
+                   help="Audio threshold for voice detection (default: 0.01)")
     p.add_argument("--enable-commands", action="store_true",
                    help="Enable action command matching")
     
@@ -274,6 +278,8 @@ def main():
         language=args.language,
         chunk_duration=args.chunk_duration,
         enable_commands=args.enable_commands,
+        min_audio_duration=args.min_audio,
+        audio_threshold=args.threshold,
     )
     
     robot.start()
