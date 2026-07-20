@@ -3,4 +3,4 @@ This repository is to create a simulation of voice to command to a robot in Ubun
 # Install requirement by
 # pip install -r requirement.txt
 # voiceCommandRobot_v5.py is the latest version.
-# Usage: python3 voiceCommandRobot_v5.py --device 2 --robot-ip 192.168.4.1 --distance-factor 0.25 --turn-factor 0.3 --default-turn-duration 2.0 --camera --wake-words
+# Usage: python3 voiceCommandRobot.py --device 2 --robot-ip 192.168.4.1 --distance-factor 0.08 --turn-factor-left 1.8 --turn-factor-right 1.5
