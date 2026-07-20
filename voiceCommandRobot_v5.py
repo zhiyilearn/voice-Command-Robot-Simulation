@@ -44,6 +44,7 @@ import time
 import subprocess
 import urllib.request
 import urllib.error
+import signal
 
 try:
     import cv2
@@ -101,11 +102,20 @@ CAMERA_COMMANDS = {
 }
 
 # Wake words to activate voice command listening
+# These are screened to be specific enough to avoid false triggers.
 WAKE_WORDS = [
-    "机器人", "小车", "助手", "小助手",
-    "wake up", "start", "hello", "hi",
-    "你好", "在吗", "开始了",
+    ("机器人", 0.9),      # High confidence - very specific
+    ("小车", 0.85),       # High confidence - specific
+    ("助手", 0.7),        # Medium confidence
+    ("小助手", 0.9),      # High confidence - very specific
+    ("wake up", 0.8),     # English wake phrase
 ]
+
+# Minimum confidence threshold to accept a wake word
+WAKE_CONFIDENCE_THRESHOLD = 0.75
+
+# Wake word must appear within the first N characters of the utterance
+WAKE_WORD_MAX_POSITION = 6
 
 # Sleep words to deactivate voice command listening
 SLEEP_WORDS = [
@@ -148,86 +158,140 @@ def timestamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Conversation heuristics to screen out regular chat
+_QUESTION_PARTICLES = ["吗", "呢", "吧", "么", "？", "?"]
+_CHAT_PRONOUNS = ["你", "我", "他", "她", "它"]
+_MEASUREMENT_UNITS = ["米", "度", "秒", "厘米", "公分"]
+
+
+def _has_measurement(text_clean: str) -> bool:
+    return any(u in text_clean for u in _MEASUREMENT_UNITS)
+
+
+def _is_likely_conversation(text: str, text_clean: str) -> bool:
+    """Heuristic: True if text looks like regular conversation, not a command."""
+    # Ends with question particle -> conversation
+    if any(text_clean.endswith(p) for p in _QUESTION_PARTICLES):
+        return True
+    # Long text with personal pronouns and no measurements -> conversation
+    if len(text_clean) > 12:
+        has_pronoun = any(p in text_clean for p in _CHAT_PRONOUNS)
+        if has_pronoun and not _has_measurement(text_clean):
+            return True
+    return False
+
+
 def understand_command(text: str) -> str:
     """Semantically understand transcribed text and return robot action.
-    
+
     Logic:
-    1. Check for camera commands first
-    2. Check for priority actions (stop, grab, release)
-    3. Detect direction and action type
-    4. Combine: direction (left/right) = turn, direction (forward/backward) = move
-    5. Return empty string if unclear/no action detected
+    1. Screen out regular conversation
+    2. Check for camera commands first
+    3. Check for priority actions (stop, grab, release)
+    4. Detect direction and action type
+    5. Combine: direction (left/right) = turn, direction (forward/backward) = move
+    6. Return empty string if unclear/no action detected
     """
     if not text:
         return ""
-    
+
     text = text.lower().strip()
     text_clean = text.replace(" ", "").replace(",", "").replace("。", "").replace("，", "")
-    
-    # 0. Camera commands (check first, distinct from movement)
+
+    # --- 0. Conversation screening ---
+    if _is_likely_conversation(text, text_clean):
+        return ""
+
+    # 1. Camera commands (check first, distinct from movement)
     for action, words in CAMERA_COMMANDS.items():
         for w in words:
             if w.lower() in text or w.lower() in text_clean:
                 return action
-    
-    # 1. Priority actions (stop, grab, release) — these override everything
+
+    # 2. Priority actions (stop, grab, release) — these override everything
     for action, words in PRIORITY_ACTIONS.items():
         for w in words:
-            if w.lower() in text or w.lower() in text_clean:
+            w_lower = w.lower()
+            if w_lower in text or w_lower in text_clean:
+                # Single-char priority words (e.g. "停") must be near the start
+                if len(w_lower) == 1:
+                    pos = text_clean.find(w_lower)
+                    if pos > 4:
+                        continue
                 return action
-    
-    # 2. Analyze direction and action type
+
+    # 3. Analyze direction and action type
     detected_direction = None
     detected_action_type = None
-    
+
     # Check for direction words
     direction_scores = {}
     for dir_type, words in DIRECTION_WORDS.items():
         score = 0
         for w in words:
             w_lower = w.lower()
+            matched = False
+            pos = -1
             if w_lower in text:
-                score += len(w)
+                matched = True
+                pos = text.find(w_lower)
             elif w_lower in text_clean:
+                matched = True
+                pos = text_clean.find(w_lower)
+            if matched:
+                # Short direction words (1-2 chars) must be near the start
+                # or the text must contain explicit measurements
+                if len(w_lower) <= 2 and pos > 6 and not _has_measurement(text_clean):
+                    continue
                 score += len(w)
         if score > 0:
             direction_scores[dir_type] = score
-    
+
     # Check for action words
     action_scores = {}
     for act_type, words in ACTION_WORDS.items():
         score = 0
         for w in words:
             w_lower = w.lower()
+            matched = False
+            pos = -1
             if w_lower in text:
-                score += len(w)
+                matched = True
+                pos = text.find(w_lower)
             elif w_lower in text_clean:
+                matched = True
+                pos = text_clean.find(w_lower)
+            if matched:
+                # Single-char action words (e.g. "走", "转") must be near the start
+                # or the text must contain explicit measurements
+                if len(w_lower) == 1 and pos > 4 and not _has_measurement(text_clean):
+                    continue
                 score += len(w)
         if score > 0:
             action_scores[act_type] = score
-    
+
     # Determine best direction and action
     if direction_scores:
-        detected_direction = max(direction_scores.keys(), 
+        detected_direction = max(direction_scores.keys(),
                                   key=lambda k: direction_scores[k])
-    
+
     if action_scores:
         detected_action_type = max(action_scores.keys(),
                                     key=lambda k: action_scores[k])
-    
-    # 3. Combine direction + action to determine robot command
+
+    # 4. Combine direction + action to determine robot command
     # IMPORTANT: left/right direction always means turn, regardless of action word
     if detected_direction == "left":
         return "left"
     if detected_direction == "right":
         return "right"
-    
+
     # Forward/backward direction means movement
     if detected_direction == "forward":
         return "up"
     if detected_direction == "backward":
         return "down"
-    
+
     # No direction detected — check action type only
     if detected_action_type == "turn":
         # "转" without direction is unclear
@@ -235,7 +299,33 @@ def understand_command(text: str) -> str:
     if detected_action_type == "move":
         # "走" without direction — default to forward
         return "up"
-    
+
+    # 5. Standalone speed adjustment commands (before falling through)
+    # These are standalone commands that change the global speed setting
+    speed_up_words = ["快点", "快一点", "快些", "快快", "加速", "加快", "高速", "快速", "最快", "全速", "快"]
+    slow_down_words = ["慢点", "慢一点", "慢些", "慢慢", "减速", "放慢", "低速", "慢速", "缓慢", "慢"]
+
+    text_len = len(text_clean)
+    for w in speed_up_words:
+        if w in text_clean:
+            pos = text_clean.find(w)
+            # Multi-char speed words: allow if text is short or word is near start
+            if len(w) >= 2:
+                if text_len <= 10 or pos <= 2:
+                    return "speed_up"
+            else:  # single char "快"
+                if text_len <= 4 or pos == 0:
+                    return "speed_up"
+    for w in slow_down_words:
+        if w in text_clean:
+            pos = text_clean.find(w)
+            if len(w) >= 2:
+                if text_len <= 10 or pos <= 2:
+                    return "speed_down"
+            else:  # single char "慢"
+                if text_len <= 4 or pos == 0:
+                    return "speed_down"
+
     # No clear action detected
     return ""
 
@@ -246,15 +336,65 @@ def match_action(text: str) -> str:
     return understand_command(text)
 
 
-def is_wake_word(text: str) -> bool:
-    """Check if text contains a wake word."""
+_COMMAND_PREFIX = "机器人"
+
+
+def strip_command_prefix(text: str) -> tuple:
+    """Strip '机器人' from command text (can appear anywhere).
+
+    Returns:
+        (has_prefix: bool, stripped_text: str)
+    """
     if not text:
-        return False
+        return False, ""
+    
+    # Clean text for finding prefix
+    text_clean = text.replace(" ", "").replace(",", "").replace("，", "").replace("。", "")
+    
+    # Check if "机器人" appears anywhere in the text
+    prefix_len = len(_COMMAND_PREFIX)
+    pos = text_clean.find(_COMMAND_PREFIX)
+    if pos != -1:
+        # Remove "机器人" from the text
+        rest = text_clean[:pos] + text_clean[pos + prefix_len:]
+        return True, rest
+    
+    # Check original text with punctuation
+    pos = text.find(_COMMAND_PREFIX)
+    if pos != -1:
+        rest = text[:pos] + text[pos + prefix_len:]
+        rest = rest.replace(" ", "").replace(",", "").replace("，", "").replace("。", "")
+        return True, rest
+    
+    return False, text
+
+
+def is_wake_word(text: str) -> tuple:
+    """Check if text contains a wake word.
+    
+    "机器人" can appear anywhere in the text; other wake words must be near the start.
+    
+    Returns:
+        (is_wake: bool, confidence: float, matched_word: str)
+    """
+    if not text:
+        return False, 0.0, ""
+    
     text_clean = text.lower().strip().replace(" ", "")
-    for word in WAKE_WORDS:
-        if word.lower().replace(" ", "") in text_clean:
-            return True
-    return False
+    
+    for word, confidence in WAKE_WORDS:
+        word_clean = word.lower().replace(" ", "")
+        pos = text_clean.find(word_clean)
+        if pos == -1:
+            continue
+        # "机器人" can appear anywhere; other wake words must be near the start
+        if word != "机器人" and pos > WAKE_WORD_MAX_POSITION:
+            continue
+        if confidence < WAKE_CONFIDENCE_THRESHOLD:
+            continue
+        return True, confidence, word
+    
+    return False, 0.0, ""
 
 
 def is_sleep_word(text: str) -> bool:
@@ -347,13 +487,15 @@ def _parse_chinese_decimal(text: str):
 
 def extract_parameters(text: str, base_speed: int = 50) -> dict:
     """Extract command parameters from text.
-    Returns dict with: duration (seconds), speed (0-100), distance (meters), angle (degrees)
+    Returns dict with: duration (seconds), speed (0-100), distance (meters),
+                        angle (degrees), speed_mps (float or None)
     """
     params = {
         "duration": None,
         "speed": base_speed,
         "distance": None,
         "angle": None,
+        "speed_mps": None,
     }
     text = text.strip()
     if not text:
@@ -361,25 +503,63 @@ def extract_parameters(text: str, base_speed: int = 50) -> dict:
 
     import re
 
-    # --- Speed modifiers ---
-    speed_up_words = ["快点", "快一点", "快些", "加速", "加快", "高速", "快速", "最快", "全速"]
-    slow_down_words = ["慢点", "慢一点", "慢些", "减速", "放慢", "低速", "慢速", "慢慢", "缓慢"]
-    for w in speed_up_words:
-        if w in text:
-            params["speed"] = min(100, base_speed + 30)
-            break
-    for w in slow_down_words:
-        if w in text:
-            params["speed"] = max(10, base_speed - 30)
-            break
+    # --- 1. Explicit speed from "每秒X米" / "速度X米" ---
+    speed_patterns = [
+        r"每秒([\d\.]+)\s*米",
+        r"速度([\d\.]+)\s*米",
+        r"每秒([零一二两三四五六七八九十百千点\.]+)\s*米",
+        r"速度([零一二两三四五六七八九十百千点\.]+)\s*米",
+    ]
+    for pat in speed_patterns:
+        m = re.search(pat, text)
+        if m:
+            speed_mps = _parse_chinese_number(m.group(1))
+            if speed_mps > 0:
+                params["speed_mps"] = speed_mps
+                # Convert m/s to internal 0-100 scale
+                internal_speed = int(speed_mps * 100)
+                params["speed"] = max(10, min(100, internal_speed))
+                break
 
-    # --- Distance (米/公尺) ---
+    # --- 2. Remove speed description before distance extraction ---
+    # This prevents "每秒零点三米" from being matched as distance
+    text_for_distance = re.sub(r"每秒[\d\.零一二两三四五六七八九十百千点]+米", "", text)
+    text_for_distance = re.sub(r"速度[\d\.零一二两三四五六七八九十百千点]+米", "", text_for_distance)
+
+    # --- 3. Relative speed modifiers (only if no explicit speed given) ---
+    if params["speed_mps"] is None:
+        text_clean = text.replace(" ", "").replace(",", "").replace("。", "").replace("，", "")
+        # Differentiated speed up: stronger words give bigger boost
+        if "快快" in text_clean or "最快" in text_clean or "全速" in text_clean:
+            params["speed"] = 100
+        elif "快一点" in text_clean or "快些" in text_clean:
+            params["speed"] = min(100, base_speed + 15)
+        elif "快点" in text_clean:
+            params["speed"] = min(100, base_speed + 20)
+        elif "快" in text_clean:
+            params["speed"] = min(100, base_speed + 25)
+        elif "加速" in text_clean or "加快" in text_clean or "高速" in text_clean or "快速" in text_clean:
+            params["speed"] = min(100, base_speed + 30)
+        # Differentiated speed down: stronger words give bigger reduction
+        elif "慢慢" in text_clean or "缓慢" in text_clean:
+            params["speed"] = max(10, base_speed - 40)
+        elif "慢一点" in text_clean or "慢些" in text_clean:
+            params["speed"] = max(10, base_speed - 15)
+        elif "慢点" in text_clean:
+            params["speed"] = max(10, base_speed - 20)
+        elif "慢" in text_clean:
+            params["speed"] = max(10, base_speed - 25)
+        elif "减速" in text_clean or "放慢" in text_clean or "低速" in text_clean or "慢速" in text_clean:
+            params["speed"] = max(10, base_speed - 30)
+
+    # --- 4. Distance (米/公尺) from cleaned text ---
+    # Chinese first, then Arabic; no bare "m" (too broad — matches random text)
     dist_patterns = [
-        r"([\d\.]+)\s*(米|公尺|m)",
-        r"([零一二两三四五六七八九十百千点\.]+)\s*(米|公尺)",
+        r"([零一二两三四五六七八九十百千]+(?:点[零一二三四五六七八九])?)\s*(米|公尺)",
+        r"(\d+(?:\.\d+)?)\s*(米|公尺)",
     ]
     for pat in dist_patterns:
-        m = re.search(pat, text)
+        m = re.search(pat, text_for_distance)
         if m:
             dist = _parse_chinese_number(m.group(1))
             if dist > 0:
@@ -388,8 +568,8 @@ def extract_parameters(text: str, base_speed: int = 50) -> dict:
 
     # --- Duration (秒/秒钟) ---
     time_patterns = [
-        r"([\d\.]+)\s*(秒|秒钟|s)\b",
         r"([零一二两三四五六七八九十百千点\.]+)\s*(秒|秒钟)",
+        r"(\d+(?:\.\d+)?)\s*(秒|秒钟)\b",
     ]
     for pat in time_patterns:
         m = re.search(pat, text)
@@ -401,8 +581,8 @@ def extract_parameters(text: str, base_speed: int = 50) -> dict:
 
     # --- Angle (度) for turns ---
     angle_patterns = [
-        r"([\d\.]+)\s*(度|°)",
-        r"([零一二两三四五六七八九十百千点\.]+)\s*(度)",
+        r"([零一二两三四五六七八九十百千点\.]+)\s*度",
+        r"(\d+(?:\.\d+)?)\s*(度|°)",
     ]
     for pat in angle_patterns:
         m = re.search(pat, text)
@@ -440,8 +620,9 @@ def compute_action_duration(params: dict, action: str, default_duration: float =
     # If distance given and it's a movement command, estimate time
     movement_actions = {"up", "down"}
     if params["distance"] is not None and action in movement_actions:
-        speed_factor = params["speed"] / 50.0
-        meters_per_second = distance_factor * speed_factor
+        # Convert internal speed (0-100) to API speed (0-50)
+        api_speed = max(0, min(50, params["speed"] // 2))
+        meters_per_second = (api_speed / 50.0) * distance_factor
         if meters_per_second > 0:
             return params["distance"] / meters_per_second
 
@@ -450,32 +631,46 @@ def compute_action_duration(params: dict, action: str, default_duration: float =
 
 def compute_turn_duration(params: dict, action: str, base_speed: int = 50,
                           turn_factor: float = 1.5,
+                          turn_factor_left: float = None,
+                          turn_factor_right: float = None,
                           default_turn_duration: float = None) -> float:
     """Compute turn duration from angle if specified.
-    
+
     Args:
         params: Parameter dict with 'angle' key
         action: 'left' or 'right'
         base_speed: Speed value (0-100)
-        turn_factor: Seconds to turn 90° at speed=50
+        turn_factor: Seconds to turn 90° at speed=50 (fallback if left/right not set)
+        turn_factor_left: Seconds to turn 90° left at speed=50
+        turn_factor_right: Seconds to turn 90° right at speed=50
         default_turn_duration: Default duration if no angle specified (seconds)
-    
+
     Returns:
         Duration in seconds, or None if no angle and no default
     """
     turn_actions = {"left", "right"}
     if action not in turn_actions:
         return None
-    
+
+    # Pick the appropriate turn factor
+    if action == "left" and turn_factor_left is not None:
+        tf = turn_factor_left
+    elif action == "right" and turn_factor_right is not None:
+        tf = turn_factor_right
+    else:
+        tf = turn_factor
+
     # If angle specified, compute from angle
     if params["angle"] is not None:
-        speed_factor = base_speed / 50.0
-        return (params["angle"] / 90.0) * turn_factor / speed_factor
-    
+        # Convert internal speed (0-100) to API speed (0-50)
+        api_speed = max(0, min(50, base_speed // 2))
+        speed_factor = api_speed / 50.0 if api_speed > 0 else 1.0
+        return (params["angle"] / 90.0) * tf / speed_factor
+
     # No angle specified - use default duration for simple turn
     if default_turn_duration is not None:
         return default_turn_duration
-    
+
     return None
 
 
@@ -608,6 +803,13 @@ def detect_complex_command(text: str) -> str:
         if "米" in text_clean:
             return "complex_forward_back_repeat"
 
+    # L1.1b 向前走2米，再向后走2米 (simple sequential, no repeat)
+    if (("向前" in text_clean or "前进" in text_clean or "往前走" in text_clean) and
+        ("向后" in text_clean or "后退" in text_clean or "往后退" in text_clean) and
+        "米" in text_clean and
+        ("再" in text_clean or "然后" in text_clean)):
+        return "complex_forward_back_simple"
+
     # L1.2 原地向左转360度，再原地向右转360度
     if (("左转" in text_clean or "向左转" in text_clean) and
         ("右转" in text_clean or "向右转" in text_clean) and
@@ -690,7 +892,9 @@ def _extract_number_from_text(text: str, unit: str = "") -> float:
 def generate_complex_sequence(action: str, text: str,
                               base_speed: int = 50,
                               distance_factor: float = 0.5,
-                              turn_factor: float = 1.5) -> list:
+                              turn_factor: float = 1.5,
+                              turn_factor_left: float = None,
+                              turn_factor_right: float = None) -> list:
     """Generate a list of basic command steps for a complex action.
 
     Each step is a dict: {action, speed, duration, label, delay_after}
@@ -705,15 +909,22 @@ def generate_complex_sequence(action: str, text: str,
     text_clean = text.replace(" ", "")
 
     def move_duration(distance_m, speed=base_speed):
-        speed_factor = speed / 50.0
-        mps = distance_factor * speed_factor
+        api_speed = max(0, min(50, speed // 2))
+        mps = (api_speed / 50.0) * distance_factor
         if mps > 0:
             return distance_m / mps
         return distance_m / distance_factor
 
-    def turn_duration(degrees, speed=base_speed):
-        speed_factor = speed / 50.0
-        return (degrees / 90.0) * turn_factor / speed_factor
+    def turn_duration(degrees, direction="right", speed=base_speed):
+        api_speed = max(0, min(50, speed // 2))
+        speed_factor = api_speed / 50.0
+        if direction == "left" and turn_factor_left is not None:
+            tf = turn_factor_left
+        elif direction == "right" and turn_factor_right is not None:
+            tf = turn_factor_right
+        else:
+            tf = turn_factor
+        return (degrees / 90.0) * tf / speed_factor
 
     if action == "complex_forward_back_repeat":
         # Forward 2m, backward 2m, repeat 3 times
@@ -752,8 +963,8 @@ def generate_complex_sequence(action: str, text: str,
 
     elif action == "complex_spin_left_right":
         # Spin left 360°, then spin right 360°
-        left_dur = turn_duration(360)
-        right_dur = turn_duration(360)
+        left_dur = turn_duration(360, "left")
+        right_dur = turn_duration(360, "right")
         steps.append({"action": "left", "speed": base_speed,
                      "duration": left_dur,
                      "label": "左转 360°",
@@ -771,6 +982,34 @@ def generate_complex_sequence(action: str, text: str,
                      "label": "停止",
                      "delay_after": 0.0})
 
+    elif action == "complex_forward_back_simple":
+        # Forward X meters, then backward Y meters (single sequence)
+        # Use extract_parameters to parse the full text
+        params = extract_parameters(text, base_speed)
+        fwd_dist = params.get("distance") or 2.0
+        if fwd_dist <= 0:
+            fwd_dist = 2.0
+
+        fwd_dur = move_duration(fwd_dist)
+        back_dur = move_duration(fwd_dist)
+
+        steps.append({"action": "up", "speed": params["speed"],
+                     "duration": fwd_dur,
+                     "label": f"前进 {fwd_dist}m",
+                     "delay_after": 0.1})
+        steps.append({"action": "stop", "speed": params["speed"],
+                     "duration": None,
+                     "label": "停止",
+                     "delay_after": 0.2})
+        steps.append({"action": "down", "speed": params["speed"],
+                     "duration": back_dur,
+                     "label": f"后退 {fwd_dist}m",
+                     "delay_after": 0.1})
+        steps.append({"action": "stop", "speed": params["speed"],
+                     "duration": None,
+                     "label": "停止",
+                     "delay_after": 0.0})
+
     elif action == "complex_diagonal":
         # Diagonal: approximate with forward + slight right turn + forward
         dist = _extract_number_from_text(text_clean, "米") or 1.0
@@ -779,7 +1018,7 @@ def generate_complex_sequence(action: str, text: str,
         # Approximate diagonal: forward 0.707x distance, turn slightly, forward 0.707x
         half_dist = dist * 0.707
         fwd_dur = move_duration(half_dist)
-        small_turn_dur = turn_duration(15)  # slight angle
+        small_turn_dur = turn_duration(15, "right")  # slight angle
 
         steps.append({"action": "up", "speed": base_speed,
                      "duration": fwd_dur,
@@ -817,10 +1056,14 @@ def generate_complex_sequence(action: str, text: str,
         for i in range(2):
             speed_mps = speeds[i]
             distance = dists[i]
-            # Convert m/s to speed value (assuming 0.5 m/s at speed=50)
+            # Convert m/s to speed value (internal 0-100)
             speed_val = int((speed_mps / distance_factor) * 50.0)
             speed_val = max(10, min(100, speed_val))
-            duration = distance / speed_mps if speed_mps > 0 else 4.0
+            # Calculate actual speed robot will move at
+            api_speed = speed_val // 2
+            actual_speed = (api_speed / 50.0) * distance_factor
+            # Calculate duration based on actual speed
+            duration = distance / actual_speed if actual_speed > 0 else 4.0
 
             steps.append({"action": "up", "speed": speed_val,
                          "duration": duration,
@@ -856,7 +1099,7 @@ def generate_complex_sequence(action: str, text: str,
         if side <= 0:
             side = 1.0
         fwd_dur = move_duration(side)
-        turn_dur = turn_duration(90)
+        turn_dur = turn_duration(90, "left")
 
         for i in range(4):
             steps.append({"action": "up", "speed": base_speed,
@@ -889,7 +1132,7 @@ def generate_complex_sequence(action: str, text: str,
         import math
         chord_length = 2 * radius * math.sin(math.radians(segment_angle / 2))
         fwd_dur = move_duration(chord_length, base_speed)
-        turn_dur = turn_duration(segment_angle, base_speed)
+        turn_dur = turn_duration(segment_angle, "left", base_speed)
 
         for i in range(num_segments):
             steps.append({"action": "up", "speed": base_speed,
@@ -912,7 +1155,7 @@ def generate_complex_sequence(action: str, text: str,
         if side <= 0:
             side = 1.0
         fwd_dur = move_duration(side)
-        turn_dur = turn_duration(120)
+        turn_dur = turn_duration(120, "left")
 
         for i in range(3):
             steps.append({"action": "up", "speed": base_speed,
@@ -943,8 +1186,8 @@ def generate_complex_sequence(action: str, text: str,
         import math
         chord_length = 2 * radius * math.sin(math.radians(segment_angle / 2))
         fwd_dur = move_duration(chord_length, base_speed)
-        left_turn_dur = turn_duration(segment_angle, base_speed)
-        right_turn_dur = turn_duration(segment_angle, base_speed)
+        left_turn_dur = turn_duration(segment_angle, "left", base_speed)
+        right_turn_dur = turn_duration(segment_angle, "right", base_speed)
 
         # Left circle
         steps.append({"action": "stop", "speed": base_speed,
@@ -991,8 +1234,8 @@ def generate_complex_sequence(action: str, text: str,
         import math
         chord_length = 2 * radius * math.sin(math.radians(segment_angle / 2))
         fwd_dur = move_duration(chord_length, base_speed)
-        left_turn_dur = turn_duration(segment_angle, base_speed)
-        right_turn_dur = turn_duration(segment_angle, base_speed)
+        left_turn_dur = turn_duration(segment_angle, "left", base_speed)
+        right_turn_dur = turn_duration(segment_angle, "right", base_speed)
 
         # First half-circle (left curve)
         for i in range(num_segments):
@@ -1024,56 +1267,137 @@ def generate_complex_sequence(action: str, text: str,
     return steps
 
 
+def test_robot_connection(robot_ip: str):
+    """Test if robot is reachable and responding."""
+    try:
+        url = f"http://{robot_ip}/api/control?action=stop&speed=0"
+        req = urllib.request.Request(url, method='GET')
+        resp = urllib.request.urlopen(req, timeout=3.0)
+        resp_content = resp.read().decode('utf-8', errors='ignore')
+        print(f"[Test] Robot {robot_ip} is reachable!")
+        print(f"[Test] Response: {resp_content}")
+        return True
+    except Exception as e:
+        print(f"[Test] Robot {robot_ip} NOT reachable: {e}")
+        return False
+
+
+def send_robot_command_sync(robot_ip: str, action: str, speed: int,
+                            duration: float = None, log_func=None,
+                            label: str = "", detail: str = ""):
+    """Synchronous version of robot command - waits for response."""
+    api_speed = max(0, min(50, speed // 2))
+    url = f"http://{robot_ip}/api/control?action={action}&speed={api_speed}"
+
+    if duration is not None and duration > 0:
+        time_ms = int(duration * 1000)
+        url += f"&time={time_ms}"
+
+    if log_func is not None:
+        log_func(f"[Robot] Sending sync: `{url}`")
+
+    # Timeout: longer for commands with duration
+    if duration is not None and duration > 5:
+        timeout = duration + 2.0
+    else:
+        timeout = 5.0
+
+    try:
+        req = urllib.request.Request(url, method='GET')
+        req.add_header('Connection', 'close')
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        resp_content = resp.read().decode('utf-8', errors='ignore')
+        resp.close()
+        if '"status":"success"' in resp_content or '"message"' in resp_content:
+            if log_func is not None:
+                log_func(f"[Robot] {label} -> OK")
+            return True, resp_content
+        else:
+            if log_func is not None:
+                log_func(f"[Robot] Response: {resp_content[:100]}")
+            return True, resp_content
+    except Exception as e:
+        if log_func is not None:
+            log_func(f"[Robot] Sync command failed: {e}", file=sys.stderr)
+        return False, str(e)
+
+
 def send_robot_command_async(robot_ip: str, action: str, speed: int,
                              duration: float = None, log_func=None,
                              label: str = "", detail: str = "",
                              output_file: str = None, text: str = "",
                              is_stop: bool = False):
-    """Reliable async HTTP command with retry logic.
-    Spawns a daemon thread that sends the request and logs the result.
-    All commands get retry logic for reliability.
+    """Reliable HTTP command with retry logic.
+
+    Robot API: GET /api/control?action=<action>&speed=<speed>&time=<time>
+      - speed: int 0-50
+      - time:  milliseconds (optional)
+
+    Internal speed is 0-100; it is converted to API 0-50 before sending.
+    Duration should be pre-computed by caller using distance/angle formulas.
     """
-    url = f"http://{robot_ip}/api/control?action={action}&speed={speed}"
-    if duration is not None:
+    # Convert internal speed (0-100) to API speed (0-50)
+    api_speed = max(0, min(50, speed // 2))
+    url = f"http://{robot_ip}/api/control?action={action}&speed={api_speed}"
+
+    if duration is not None and duration > 0:
         time_ms = int(duration * 1000)
         url += f"&time={time_ms}"
 
     def _worker():
         ok = False
         last_error = None
-        retries = 5 if is_stop else 4
-        timeout = 3.0 if is_stop else 2.5
+        # More retries for stop, more generous timeouts
+        retries = 5 if is_stop else 3
+        # Timeout: longer for commands with duration, shorter for stop
+        if duration is not None and duration > 5:
+            timeout = duration + 2.0
+        elif is_stop:
+            timeout = 2.0
+        else:
+            timeout = 3.0
 
         # Debug: log the URL being sent
         if log_func is not None:
-            log_func(f"[Robot] Sending: {url}")
+            log_func(f"[Robot] Sending: `{url}`")
 
         for attempt in range(retries):
             try:
+                # Create new connection each time to avoid connection reuse issues
                 req = urllib.request.Request(url, method='GET')
+                # Force connection close to prevent connection pooling issues
+                req.add_header('Connection', 'close')
+
+                # Use socket timeout to prevent hanging
                 resp = urllib.request.urlopen(req, timeout=timeout)
-                resp_content = resp.read()
+                resp_content = resp.read().decode('utf-8', errors='ignore')
+                resp.close()
                 ok = True
-                if log_func is not None:
-                    log_func(f"[Robot] Response: {resp_content.decode('utf-8', errors='ignore')[:100]}")
+                # Check response content for actual success
+                if '"status":"success"' in resp_content or '"message"' in resp_content:
+                    if log_func is not None:
+                        log_func(f"[Robot] {label} -> OK")
+                else:
+                    if log_func is not None:
+                        log_func(f"[Robot] Response: {resp_content[:100]}")
                 break
             except urllib.error.URLError as e:
                 last_error = f"URL Error: {e.reason}"
                 if log_func is not None:
                     log_func(f"[Robot] Retry {attempt+1}/{retries} for {action}: {last_error}", file=sys.stderr)
-                time.sleep(0.3 * (attempt + 1))
+                time.sleep(0.2 * (attempt + 1))  # Reduced from 0.5 for lower latency
             except urllib.error.HTTPError as e:
                 last_error = f"HTTP {e.code}"
                 if e.code == 404:
                     break  # Don't retry on 404
                 if log_func is not None:
                     log_func(f"[Robot] Retry {attempt+1}/{retries} for {action}: {last_error}", file=sys.stderr)
-                time.sleep(0.3 * (attempt + 1))
+                time.sleep(0.2 * (attempt + 1))  # Reduced from 0.5 for lower latency
             except Exception as e:
                 last_error = str(e)
                 if log_func is not None:
                     log_func(f"[Robot] Retry {attempt+1}/{retries} for {action}: {last_error}", file=sys.stderr)
-                time.sleep(0.3 * (attempt + 1))
+                time.sleep(0.2 * (attempt + 1))  # Reduced from 0.5 for lower latency
 
         status = "OK" if ok else "FAIL"
         detail_str = f" [{detail}]" if detail else ""
@@ -1087,8 +1411,11 @@ def send_robot_command_async(robot_ip: str, action: str, speed: int,
             except Exception:
                 pass
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    if is_stop:
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+    else:
+        _worker()
 
 
 def write_log(text: str, filepath: str):
@@ -1405,6 +1732,8 @@ class VoiceRobot:
         self.robot_duration = args.duration
         self.distance_factor = args.distance_factor
         self.turn_factor = args.turn_factor
+        self.turn_factor_left = args.turn_factor_left if args.turn_factor_left is not None else args.turn_factor
+        self.turn_factor_right = args.turn_factor_right if args.turn_factor_right is not None else args.turn_factor
         self.default_turn_duration = args.default_turn_duration  # Default duration for simple turns
         self.model_dir = args.model_dir
         self.quiet = args.quiet
@@ -1429,6 +1758,14 @@ class VoiceRobot:
         self._sequence_thread = None
         self._sequence_running = False
         self._sequence_stop_requested = False
+
+        # Streaming ASR state
+        self._no_streaming = getattr(args, 'no_streaming', False)
+        self._stream_interval = 1.0
+        self._stream_thread = None
+        self._stream_result = [None]
+        self._last_stream_frames = 0
+        self._stream_displayed = False
 
     def _log(self, msg, file=None, flush=True):
         if not self.quiet:
@@ -1542,15 +1879,27 @@ class VoiceRobot:
 
     def _start_recorder(self):
         if os.path.exists(PCM_FILE):
-            os.remove(PCM_FILE)
+            try:
+                os.remove(PCM_FILE)
+            except Exception:
+                pass
 
-        # Kill any existing arecord processes that might be using the device
-        try:
-            subprocess.run(["pkill", "-9", "-f", "arecord"], 
-                          capture_output=True, timeout=1.0)
+        # Aggressively kill any existing audio recorder processes that might
+        # be holding the ALSA device (prevents "设备或资源忙" errors).
+        self._log("[Recorder] Cleaning up existing audio processes...", file=sys.stderr)
+        for _ in range(2):
+            for proc_name in ["arecord", "ascend"]:
+                try:
+                    subprocess.run(["killall", "-9", proc_name],
+                                   capture_output=True, timeout=1.0)
+                except Exception:
+                    pass
+                try:
+                    subprocess.run(["pkill", "-9", "-f", proc_name],
+                                   capture_output=True, timeout=1.0)
+                except Exception:
+                    pass
             time.sleep(0.3)
-        except Exception:
-            pass
 
         available_devices = self._detect_alsa_devices()
         if available_devices:
@@ -1625,12 +1974,27 @@ class VoiceRobot:
         return False
 
     def _stop_recorder(self):
+        # Terminate our own recorder process
         if self._recorder_proc and self._recorder_proc.poll() is None:
             self._recorder_proc.terminate()
             try:
                 self._recorder_proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    os.killpg(os.getpgid(self._recorder_proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+        self._recorder_proc = None
+
+        # Kill any leftover arecord/ascend processes so the audio device is
+        # released for the next run.
+        self._log("[Recorder] Killing leftover audio processes...", file=sys.stderr)
+        for proc_name in ["arecord", "ascend"]:
+            for cmd in [["killall", "-9", proc_name], ["pkill", "-9", "-f", proc_name]]:
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=1.0)
+                except Exception:
+                    pass
         self._log("[Recorder] Stopped.")
 
     def _dispatch_command(self, text: str, action: str = None):
@@ -1653,6 +2017,39 @@ class VoiceRobot:
                 pass
             return False
 
+        # Standalone speed adjustment commands
+        if action == "speed_up":
+            text_clean = text.replace(" ", "").replace(",", "").replace("。", "").replace("，", "")
+            old_speed = self.robot_speed
+            # Differentiate speed up levels based on command
+            if "快快" in text_clean or "最快" in text_clean or "全速" in text_clean:
+                self.robot_speed = 100
+            elif "快一点" in text_clean or "快些" in text_clean:
+                self.robot_speed = min(100, self.robot_speed + 15)
+            elif "快点" in text_clean:
+                self.robot_speed = min(100, self.robot_speed + 20)
+            else:  # "快"
+                self.robot_speed = min(100, self.robot_speed + 25)
+            api_speed = max(0, min(50, self.robot_speed // 2))
+            self._log(f"[Speed] {old_speed} → {self.robot_speed} (API: {api_speed})")
+            return True
+
+        if action == "speed_down":
+            text_clean = text.replace(" ", "").replace(",", "").replace("。", "").replace("，", "")
+            old_speed = self.robot_speed
+            # Differentiate speed down levels based on command
+            if "慢慢" in text_clean or "缓慢" in text_clean:
+                self.robot_speed = max(10, self.robot_speed - 40)
+            elif "慢一点" in text_clean or "慢些" in text_clean:
+                self.robot_speed = max(10, self.robot_speed - 15)
+            elif "慢点" in text_clean:
+                self.robot_speed = max(10, self.robot_speed - 20)
+            else:  # "慢"
+                self.robot_speed = max(10, self.robot_speed - 25)
+            api_speed = max(0, min(50, self.robot_speed // 2))
+            self._log(f"[Speed] {old_speed} → {self.robot_speed} (API: {api_speed})")
+            return True
+
         camera_actions = {"camera_on", "camera_off", "photo", "record_start", "record_stop"}
         if action in camera_actions:
             self._handle_camera_command(action, text)
@@ -1674,6 +2071,8 @@ class VoiceRobot:
         )
         turn_dur = compute_turn_duration(
             params, action, params["speed"], self.turn_factor,
+            self.turn_factor_left,
+            self.turn_factor_right,
             self.default_turn_duration  # Use default for simple turns
         )
         if turn_dur is not None:
@@ -1687,19 +2086,24 @@ class VoiceRobot:
             detail_parts.append(f"{params['angle']}\u00b0")
         if params["duration"] is not None:
             detail_parts.append(f"{params['duration']}s")
-        if params["speed"] != self.robot_speed:
+        if params["speed_mps"] is not None:
+            detail_parts.append(f"{params['speed_mps']}m/s")
+        elif params["speed"] != self.robot_speed:
             detail_parts.append(f"speed={params['speed']}")
         detail = ", ".join(detail_parts)
 
+        cmd_info = f"[指令] {label} ({action})" + (f" [{detail}]" if detail else "")
+        print(cmd_info, flush=True)
         self._log(f"[Command] {label} ({action})" + (f" [{detail}]" if detail else ""))
 
         if self.robot_ip:
             is_stop = (action == "stop")
-            
+
             if action == "stop":
                 self._stop_sequence()
-                
-                url = f"http://{self.robot_ip}/api/control?action=stop&speed={self.robot_speed}"
+
+                api_speed = max(0, min(50, self.robot_speed // 2))
+                url = f"http://{self.robot_ip}/api/control?action=stop&speed={api_speed}"
                 self._log(f"[Robot] Sending STOP (x3)...")
                 for i in range(3):
                     try:
@@ -1709,7 +2113,7 @@ class VoiceRobot:
                     except Exception as e:
                         self._log(f"[Robot] STOP attempt {i+1} failed: {e}", file=sys.stderr)
                     if i < 2:
-                        time.sleep(0.05)
+                        time.sleep(0.02)  # Reduced from 0.05 for lower latency
                 self._log(f"[Robot] {label} ({action}) -> OK")
                 self._needs_wakeup = True
             else:
@@ -1723,7 +2127,17 @@ class VoiceRobot:
                         output_file=None, text="",
                         is_stop=True,
                     )
-                    time.sleep(0.1)
+                    # Reduced from 0.1s to 0.01s for lower latency
+                    time.sleep(0.01)
+                # Always send stop first to ensure clean state before new movement
+                send_robot_command_async(
+                    self.robot_ip, "stop", params["speed"], None,
+                    log_func=None, label="", detail="",
+                    output_file=None, text="",
+                    is_stop=True,
+                )
+                # Reduced from 0.05s to 0.01s for lower latency
+                time.sleep(0.01)
                 send_robot_command_async(
                     self.robot_ip, action, params["speed"], dur,
                     log_func=self._log, label=label, detail=detail,
@@ -1775,6 +2189,8 @@ class VoiceRobot:
             base_speed=self.robot_speed,
             distance_factor=self.distance_factor,
             turn_factor=self.turn_factor,
+            turn_factor_left=self.turn_factor_left,
+            turn_factor_right=self.turn_factor_right,
         )
 
         if not steps:
@@ -1823,6 +2239,14 @@ class VoiceRobot:
                                 is_stop=True,
                             )
                             time.sleep(0.1)
+                        # Always send stop first to ensure clean state before new movement
+                        send_robot_command_async(
+                            self.robot_ip, "stop", step_speed, None,
+                            log_func=None, label="", detail="",
+                            output_file=None, text="",
+                            is_stop=True,
+                        )
+                        time.sleep(0.05)
                         send_robot_command_async(
                             self.robot_ip, step_action, step_speed, step_duration,
                             log_func=None, label="", detail="",
@@ -1862,7 +2286,7 @@ class VoiceRobot:
             if self.robot_ip:
                 self._log("[Sequence] Stopping sequence - sending STOP...")
                 for i in range(3):
-                    url = f"http://{self.robot_ip}/api/control?action=stop&speed={self.robot_speed}"
+                    url = f"http://{self.robot_ip}/api/control?action=stop&speed={max(0, min(50, self.robot_speed // 2))}"
                     try:
                         req = urllib.request.Request(url, method='GET')
                         resp = urllib.request.urlopen(req, timeout=1.0)
@@ -1875,7 +2299,7 @@ class VoiceRobot:
 
     def _send_stop_blocking(self):
         """Send stop command synchronously with retry."""
-        url = f"http://{self.robot_ip}/api/control?action=stop&speed={self.robot_speed}"
+        url = f"http://{self.robot_ip}/api/control?action=stop&speed={max(0, min(50, self.robot_speed // 2))}"
         for attempt in range(3):
             try:
                 req = urllib.request.Request(url, method='GET')
@@ -1887,16 +2311,15 @@ class VoiceRobot:
                     time.sleep(0.1)
         return False
 
-    def _process_segment(self, speech_segment, output_history):
+    def _process_streaming_segment(self, speech_segment):
+        """Run ASR on accumulated audio for interim display. No command execution."""
+        if not speech_segment:
+            return None
         audio_full = np.concatenate(speech_segment)
-        min_samples = int(self.sample_rate * 0.1)
-        audio_duration = len(audio_full) / self.sample_rate
-
+        min_samples = int(self.sample_rate * 0.3)
         if len(audio_full) < min_samples:
-            self._log(f"[ASR] Skipped: too short ({audio_duration:.2f}s < 0.1s)", file=sys.stderr)
-            return
+            return None
 
-        self._log(f"[ASR] Processing {audio_duration:.2f}s segment...", file=sys.stderr)
         result = [None]
         def _do_generate():
             try:
@@ -1906,17 +2329,72 @@ class VoiceRobot:
 
         t_gen = threading.Thread(target=_do_generate, daemon=True)
         t_gen.start()
-        t_gen.join(timeout=5.0)
+        t_gen.join(timeout=3.0)
 
-        if t_gen.is_alive():
-            self._log("[ASR] Model inference timed out, skipping.", file=sys.stderr)
-            return
-
-        if isinstance(result[0], Exception):
-            self._log(f"[ASR] Error: {result[0]}", file=sys.stderr)
-            return
+        if t_gen.is_alive() or isinstance(result[0], Exception):
+            return None
 
         text = result[0][0].get('text', '').strip() if result[0] and len(result[0]) > 0 else ""
+        if not text:
+            return None
+
+        text = clean_asr_text(text)
+        if not text or is_hallucination(text):
+            return None
+
+        text = remove_internal_repeats(text).strip()
+        if not text:
+            return None
+
+        corrected = correct_asr_errors(text)
+        if corrected != text:
+            text = corrected
+
+        return text
+
+    def _process_segment(self, speech_segment, output_history):
+        audio_full = np.concatenate(speech_segment)
+        min_samples = int(self.sample_rate * 0.2)  # Min 200ms to avoid processing noise
+        audio_duration = len(audio_full) / self.sample_rate
+
+        if len(audio_full) < min_samples:
+            self._log(f"[ASR] Skipped: too short ({audio_duration:.2f}s < 0.2s)", file=sys.stderr)
+            return
+
+
+
+        # Try ASR with retry on timeout/error
+        max_retries = 2
+        text = None
+        for attempt in range(max_retries):
+            result = [None]
+            def _do_generate():
+                try:
+                    result[0] = self._model.generate(audio_full)
+                except Exception as e:
+                    result[0] = e
+
+            t_gen = threading.Thread(target=_do_generate, daemon=True)
+            t_gen.start()
+            t_gen.join(timeout=10.0)  # Increased timeout for longer segments
+
+            if t_gen.is_alive():
+                if attempt < max_retries - 1:
+                    self._log(f"[ASR] Model inference timed out, retrying ({attempt+1}/{max_retries})...", file=sys.stderr)
+                    continue
+                self._log("[ASR] Model inference timed out after retries, skipping.", file=sys.stderr)
+                return
+
+            if isinstance(result[0], Exception):
+                if attempt < max_retries - 1:
+                    self._log(f"[ASR] Error: {result[0]}, retrying ({attempt+1}/{max_retries})...", file=sys.stderr)
+                    continue
+                self._log(f"[ASR] Error after retries: {result[0]}", file=sys.stderr)
+                return
+
+            text = result[0][0].get('text', '').strip() if result[0] and len(result[0]) > 0 else ""
+            break
+
         if not text:
             self._log("[ASR] Empty result from model", file=sys.stderr)
             return
@@ -1941,28 +2419,19 @@ class VoiceRobot:
             self._log(f"[ASR] Corrected '{text}' -> '{corrected}'", file=sys.stderr)
             text = corrected
 
+        # Shorter duplicate window to allow legitimate repeated commands
         for old_text, old_time in output_history:
-            if time.time() - old_time > 10.0:
+            if time.time() - old_time > 5.0:  # Reduced from 10s to 5s
                 continue
             if is_duplicate(text, old_text):
                 self._log(f"[ASR] Skipped duplicate: '{text}'", file=sys.stderr)
                 return
 
         output_history.append((text, time.time()))
-        if len(output_history) > 10:
+        if len(output_history) > 15:  # Increased history size
             output_history.pop(0)
 
-        # Check wake/sleep words first (always active)
-        if is_wake_word(text):
-            if not self._awake:
-                self._awake = True
-                self._last_activity_time = time.time()
-                print(f">>> {text}  [已唤醒 / WAKE UP]", flush=True)
-                self._log("[Wake] System activated by wake word.")
-            else:
-                print(f">>> {text}  [已唤醒]", flush=True)
-            return
-
+        # Check sleep words first (always active)
         if is_sleep_word(text):
             if self._awake:
                 self._awake = False
@@ -1972,13 +2441,32 @@ class VoiceRobot:
                 print(f">>> {text}  [休眠中]", flush=True)
             return
 
+        # Check wake words (always active)
+        is_wake, conf, word = is_wake_word(text)
+        if is_wake:
+            if not self._awake:
+                self._awake = True
+                self._last_activity_time = time.time()
+                print(f">>> {text}  [已唤醒 / WAKE UP]", flush=True)
+                self._log(f"[Wake] System activated by wake word '{word}' (conf={conf:.2f}).")
+            else:
+                print(f">>> {text}  [已唤醒]", flush=True)
+
         # If in sleep mode, show text but don't execute commands
         if not self._awake:
             print(f">>> {text}  [休眠中 - 说唤醒词激活]", flush=True)
             return
 
-        # System is awake - normal command processing
-        print(f">>> {text}", flush=True)
+        # System is awake - require "机器人" anywhere in the text for commands
+        has_prefix, cmd_text = strip_command_prefix(text)
+        if not has_prefix:
+            print(f">>> {text}  [忽略 - 未检测到'机器人']", flush=True)
+            self._log(f"[Filter] Ignored: '机器人' not found in '{text}'")
+            self._last_activity_time = time.time()
+            return
+
+        print(f">>> {text}  [指令: {cmd_text}]", flush=True)
+        text = cmd_text
 
         # Check idle timeout
         if self._wake_word_mode and self._idle_timeout > 0:
@@ -2009,14 +2497,19 @@ class VoiceRobot:
         self._log(f"  Audio device : {self.device}")
         self._log(f"  Sample rate  : {self.sample_rate} Hz")
         self._log(f"  Delay        : {self.delay_seconds}s")
+        self._log(f"  VAD          : split @ ~0.6s silence, max segment 20s (long commands supported)")
         if self.robot_ip:
             self._log(f"  Robot IP     : {self.robot_ip}")
-            self._log(f"  Speed        : {self.robot_speed}")
+            self._log(f"  Speed        : {self.robot_speed} (API: {max(0, min(50, self.robot_speed // 2))})")
             self._log(f"  Calibration  : {self.distance_factor} m/s at speed=50")
-            self._log(f"  Turn calib   : {self.turn_factor}s per 90° at speed=50")
+            if self.turn_factor_left != self.turn_factor or self.turn_factor_right != self.turn_factor:
+                self._log(f"  Turn left    : {self.turn_factor_left}s per 90° at speed=50")
+                self._log(f"  Turn right   : {self.turn_factor_right}s per 90° at speed=50")
+            else:
+                self._log(f"  Turn calib   : {self.turn_factor}s per 90° at speed=50")
             self._log("  Calibrate    : Say '左转九十度' and measure actual turn")
-            self._log("                 If >90°: lower --turn-factor")
-            self._log("                 If <90°: raise --turn-factor")
+            self._log("                 If >90°: lower --turn-factor-left / --turn-factor-right")
+            self._log("                 If <90°: raise --turn-factor-left / --turn-factor-right")
         if self._wake_word_mode:
             self._log(f"  Wake mode    : ON (idle timeout: {self._idle_timeout}s)")
             self._log("  Wake words   : 机器人, 小车, 助手, wake up, hello, 你好...")
@@ -2051,7 +2544,7 @@ class VoiceRobot:
             last_err = None
             for attempt in range(3):
                 try:
-                    url = f"http://{self.robot_ip}/api/control?action=stop&speed={self.robot_speed}"
+                    url = f"http://{self.robot_ip}/api/control?action=stop&speed={max(0, min(50, self.robot_speed // 2))}"
                     req = urllib.request.Request(url, method='GET')
                     resp = urllib.request.urlopen(req, timeout=2.0)
                     resp.read()
@@ -2066,15 +2559,39 @@ class VoiceRobot:
                 self._log(f"[Robot] WARNING: Cannot connect to {self.robot_ip}, commands may fail! ({last_err})", file=sys.stderr)
 
         bytes_per_sec = self.sample_rate * SAMPLE_WIDTH
-        buffer_delay = min(self.delay_seconds, 0.1)
+        buffer_delay = min(self.delay_seconds, 0.03)  # Cap at 30ms for low latency
         delay_bytes = int(bytes_per_sec * buffer_delay)
 
+        # --- VAD (Voice Activity Detection) parameters ---
+        # Frame size: 512 samples @ 16kHz = 32ms per frame.
         frame_size = 512
         frame_bytes = frame_size * SAMPLE_WIDTH
-        max_segment_frames = int(self.sample_rate * 3 / frame_size)
-        silence_frames_threshold = 3
+
+        # Maximum length of a single speech segment (seconds). Long commands
+        # may take several seconds to speak, so allow up to 20s as a safety cap.
+        max_segment_seconds = 20.0
+        max_segment_frames = int(self.sample_rate * max_segment_seconds / frame_size)
+
+        # End-of-utterance silence threshold. Reduced from 19 to 14 (~450ms)
+        # for faster command execution. Still longer than natural mid-sentence
+        # pauses (200-400ms) so commands are not split.
+        silence_frames_threshold = 14
+
+        # Number of consecutive voiced frames required before speech is
+        # considered to have started (filters out brief clicks / noise).
         vad_start_frames = 1
+
+        # Pre-roll: keep this many recent frames in a ring buffer so that when
+        # speech is detected we can prepend them and avoid clipping the first
+        # syllable of the utterance. Reduced from 10 to 6 (~192ms) for lower latency.
+        pre_roll_frames = 6
+
+        # Minimum number of voiced frames required to actually run ASR on a
+        # captured segment. Reduced from 2 to 2 (kept).
+        min_voiced_frames = 2
+
         command_cooldown = 1.0
+        stream_interval_frames = int(self.sample_rate * self._stream_interval / frame_size)
 
         buffer_wait_timeout = 10.0
         buffer_wait_start = time.time()
@@ -2125,8 +2642,7 @@ class VoiceRobot:
                     if file_size >= delay_bytes:
                         buffer_ready = True
                         break
-                    if file_size > 0:
-                        self._log(f"[Recorder] Buffer filling... {file_size}/{delay_bytes} bytes", file=sys.stderr)
+                    # Suppress "Buffer filling" log to keep command line clean
                 except OSError:
                     pass
             
@@ -2136,7 +2652,7 @@ class VoiceRobot:
             self._log("[ASR] Cannot start listening - audio buffer not ready", file=sys.stderr)
             return
 
-        self._log("[ASR] Listening...")
+        print("[ASR] Listening...", flush=True)
 
         if self._auto_start_camera and self.robot_ip:
             self._handle_camera_command("camera_on", "")
@@ -2146,8 +2662,11 @@ class VoiceRobot:
         output_history = []
 
         speech_segment = []
-        vad_frames = 0
-        silence_frames = 0
+        in_speech = False          # are we actively capturing a segment?
+        consec_voiced = 0          # consecutive voiced frames (for speech-start detection)
+        voiced_total = 0           # total voiced frames in the current segment
+        silence_frames = 0         # consecutive silent frames since last voiced frame
+        pre_roll = []              # ring buffer of recent frames (avoids clipping speech start)
         last_file_size = 0
         no_growth_count = 0
         self._running = True
@@ -2158,9 +2677,7 @@ class VoiceRobot:
             while self._running:
                 try:
                     loop_counter += 1
-                    if loop_counter >= 100:
-                        loop_counter = 0
-                        self._log("[ASR] heartbeat")
+                    # Heartbeat removed to keep command line clean
 
                     file_size = os.path.getsize(PCM_FILE)
                 except OSError:
@@ -2203,24 +2720,103 @@ class VoiceRobot:
                         audio_np = np.clip(audio_np * self.audio_gain, -1.0, 1.0)
 
                     rms = np.sqrt(np.mean(audio_np ** 2))
+                    is_voiced = rms > self.audio_threshold
 
-                    if rms > self.audio_threshold:
-                        vad_frames += 1
+                    if not in_speech:
+                        # --- Waiting for speech to start ---
+                        # Keep a rolling pre-roll buffer so the first syllable
+                        # is not clipped when speech begins.
+                        pre_roll.append(audio_np)
+                        if len(pre_roll) > pre_roll_frames:
+                            pre_roll.pop(0)
+
+                        if is_voiced:
+                            consec_voiced += 1
+                            if consec_voiced >= vad_start_frames:
+                                # Speech confirmed; seed the segment with the
+                                # pre-roll context and switch to capture mode.
+                                in_speech = True
+                                speech_segment = list(pre_roll)
+                                voiced_total = consec_voiced
+                                silence_frames = 0
+                                self._last_stream_frames = 0
+                                self._stream_displayed = False
+                                print("🎤 [语音检测...]", flush=True)
+                        else:
+                            consec_voiced = 0
+                        continue
+
+                    # --- Inside a speech segment ---
+                    # Capture all audio (speech + inter-word silence) so that
+                    # a long multi-clause command stays together until a real
+                    # end-of-command pause is reached.
+                    speech_segment.append(audio_np)
+                    if is_voiced:
+                        voiced_total += 1
                         silence_frames = 0
-                        if vad_frames >= vad_start_frames:
-                            speech_segment.append(audio_np)
                     else:
                         silence_frames += 1
-                        if vad_frames >= vad_start_frames:
-                            speech_segment.append(audio_np)
 
+                    # A segment ends when EITHER:
+                    #   * a natural silence long enough to signal a command
+                    #     boundary occurs (~0.5s), which splits a long voice
+                    #     command into its natural sub-utterances, OR
+                    #   * the safety cap on segment length is hit.
                     segment_ready = (silence_frames >= silence_frames_threshold
                                      or len(speech_segment) >= max_segment_frames)
-                    if segment_ready and len(speech_segment) > 0:
-                        self._process_segment(speech_segment, output_history)
+
+                    # --- Streaming ASR during ongoing speech ---
+                    if not self._no_streaming and not segment_ready:
+                        frames_since_stream = len(speech_segment) - self._last_stream_frames
+                        if frames_since_stream >= stream_interval_frames:
+                            if self._stream_thread is None or not self._stream_thread.is_alive():
+                                seg_copy = list(speech_segment)
+                                self._stream_result = [None]
+                                def _do_stream():
+                                    self._stream_result[0] = self._process_streaming_segment(seg_copy)
+                                self._stream_thread = threading.Thread(target=_do_stream, daemon=True)
+                                self._stream_thread.start()
+                                self._last_stream_frames = len(speech_segment)
+
+                        # Check if streaming result is ready
+                        if self._stream_thread is not None and not self._stream_thread.is_alive():
+                            stext = self._stream_result[0]
+                            if stext:
+                                pad = 80
+                                line = f"\r>>> {stext}  [听写中...]"
+                                sys.stdout.write(line.ljust(pad))
+                                sys.stdout.flush()
+                                self._stream_displayed = True
+                            self._stream_thread = None
+
+                    if segment_ready:
+                        # Only run ASR when the segment held meaningful speech;
+                        # otherwise discard the captured noise.
+                        if voiced_total >= min_voiced_frames:
+                            # Clear any streaming display line before final output
+                            if self._stream_displayed:
+                                sys.stdout.write("\r" + " " * 80 + "\r")
+                                sys.stdout.flush()
+                                self._stream_displayed = False
+
+                            # Briefly wait for any ongoing streaming ASR to avoid model contention
+                            if self._stream_thread is not None and self._stream_thread.is_alive():
+                                self._stream_thread.join(timeout=0.5)
+
+                            print("📝 [识别中...]", flush=True)
+                            self._process_segment(speech_segment, output_history)
+                        else:
+                            # Suppress dropped segment log to keep command line clean
+                            pass
+                        # Reset state for the next utterance.
                         speech_segment = []
-                        vad_frames = 0
+                        in_speech = False
+                        consec_voiced = 0
+                        voiced_total = 0
                         silence_frames = 0
+                        pre_roll = []
+                        self._last_stream_frames = 0
+                        self._stream_displayed = False
 
         except KeyboardInterrupt:
             self._log("\nStopping...")
@@ -2232,7 +2828,7 @@ class VoiceRobot:
                 time.sleep(0.3)
             if self.robot_ip:
                 self._log("[Shutdown] Sending STOP to robot (x3)...")
-                url = f"http://{self.robot_ip}/api/control?action=stop&speed={self.robot_speed}"
+                url = f"http://{self.robot_ip}/api/control?action=stop&speed={max(0, min(50, self.robot_speed // 2))}"
                 for i in range(3):
                     try:
                         req = urllib.request.Request(url, method='GET')
@@ -2281,6 +2877,10 @@ def main():
                         help="ALSA card number (use --list-alsa-devices to see)")
     parser.add_argument("--robot-ip", default=None,
                         help="Robot car IP (e.g. 192.168.4.1)")
+    parser.add_argument("--test-connection", action="store_true",
+                        help="Test robot connection and exit")
+    parser.add_argument("--test-robot", action="store_true",
+                        help="Test actual robot movement commands")
     parser.add_argument("--speed", type=int, default=50,
                         help="Robot speed 0-100 (default: 50)")
     parser.add_argument("--duration", type=float, default=None,
@@ -2289,10 +2889,14 @@ def main():
                         help="Meters per second at speed=50 (default: 0.3, typical small robot)")
     parser.add_argument("--turn-factor", type=float, default=0.5,
                         help="Seconds to turn 90° at speed=50 (default: 0.5)")
+    parser.add_argument("--turn-factor-left", type=float, default=None,
+                        help="Seconds to turn 90° left at speed=50 (falls back to --turn-factor)")
+    parser.add_argument("--turn-factor-right", type=float, default=None,
+                        help="Seconds to turn 90° right at speed=50 (falls back to --turn-factor)")
     parser.add_argument("--default-turn-duration", type=float, default=1.0,
                         help="Default duration for simple turns without angle (default: 1.0s)")
-    parser.add_argument("--delay", type=float, default=0.1,
-                        help="Recorder→transcriber delay in seconds (default: 0.1, optimized)")
+    parser.add_argument("--delay", type=float, default=0.02,
+                        help="Recorder→transcriber delay in seconds (default: 0.02, optimized for low latency)")
     parser.add_argument("--threshold", type=float, default=0.003,
                         help="VAD RMS threshold (default: 0.003, lower = more sensitive)")
     parser.add_argument("--gain", type=float, default=1.0,
@@ -2317,11 +2921,50 @@ def main():
                         help="Enable wake-word mode (system sleeps until wake word detected)")
     parser.add_argument("--idle-timeout", type=float, default=30.0,
                         help="Idle timeout in seconds before auto-sleep (default: 30, requires --wake-word)")
+    parser.add_argument("--no-streaming", action="store_true",
+                        help="Disable real-time streaming ASR display")
 
     args = parser.parse_args()
 
     if args.list_alsa_devices:
         list_alsa_devices()
+        return
+
+    if args.test_connection:
+        if not args.robot_ip:
+            print("ERROR: --robot-ip is required for --test-connection")
+            sys.exit(1)
+        test_robot_connection(args.robot_ip)
+        return
+
+    if args.test_robot:
+        if not args.robot_ip:
+            print("ERROR: --robot-ip is required for --test-robot")
+            sys.exit(1)
+        print(f"Testing robot commands on {args.robot_ip}...")
+        print("Press Ctrl+C to stop.")
+        import time
+        test_cmds = [
+            ("stop", 50, None, "Stop"),
+            ("up", 50, 1.0, "Forward 1s"),
+            ("stop", 50, None, "Stop"),
+            ("down", 50, 1.0, "Backward 1s"),
+            ("stop", 50, None, "Stop"),
+            ("left", 50, 0.5, "Left 0.5s"),
+            ("stop", 50, None, "Stop"),
+            ("right", 50, 0.5, "Right 0.5s"),
+            ("stop", 50, None, "Stop"),
+        ]
+        for action, speed, duration, label in test_cmds:
+            print(f"\nSending: {label} ({action}, speed={speed}, duration={duration})")
+            success, resp = send_robot_command_sync(args.robot_ip, action, speed, duration,
+                                                   log_func=print, label=label)
+            print(f"  Result: {'SUCCESS' if success else 'FAIL'}")
+            if resp:
+                print(f"  Response: {resp}")
+            if action != "stop":
+                time.sleep(duration + 0.5 if duration else 0.5)
+        print("\nTest completed!")
         return
 
     if args.test_commands:
@@ -2383,7 +3026,12 @@ def main():
             action = match_action(phrase)
             params = extract_parameters(phrase, 50)
             dur = compute_action_duration(params, action, None)
-            turn_dur = compute_turn_duration(params, action, params["speed"])
+            turn_dur = compute_turn_duration(
+                params, action, params["speed"],
+                turn_factor=args.turn_factor,
+                turn_factor_left=args.turn_factor_left,
+                turn_factor_right=args.turn_factor_right,
+            )
             if turn_dur is not None:
                 dur = turn_dur
             dist_str = f"{params['distance']}m" if params["distance"] is not None else "—"
@@ -2395,6 +3043,45 @@ def main():
         return
 
     robot = VoiceRobot(args)
+
+    # Ensure recorder processes are killed and robot stopped on unexpected exit
+    import atexit
+    def _cleanup_on_exit():
+        if robot.robot_ip:
+            robot._log("[Exit] Stopping robot...")
+            robot._stop_sequence()
+            robot._send_stop_blocking()
+        robot._stop_recorder()
+        for proc_name in ["arecord", "ascend"]:
+            for cmd in [["killall", "-9", proc_name], ["pkill", "-9", "-f", proc_name]]:
+                try:
+                    subprocess.run(cmd, capture_output=True, timeout=1.0)
+                except Exception:
+                    pass
+    atexit.register(_cleanup_on_exit)
+
+    # Handle SIGTERM gracefully (e.g. from systemd or kill command)
+    def _sigterm_handler(signum, frame):
+        robot._log("[Signal] SIGTERM received, shutting down...", file=sys.stderr)
+        if robot.robot_ip:
+            robot._stop_sequence()
+            robot._send_stop_blocking()
+        robot._running = False
+        robot._stop_recorder()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
+    # Handle SIGINT gracefully (Ctrl+C) to guarantee robot stops
+    def _sigint_handler(signum, frame):
+        robot._log("[Signal] SIGINT received, shutting down...", file=sys.stderr)
+        if robot.robot_ip:
+            robot._stop_sequence()
+            robot._send_stop_blocking()
+        robot._running = False
+        robot._stop_recorder()
+        sys.exit(0)
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     robot.run()
 
 
