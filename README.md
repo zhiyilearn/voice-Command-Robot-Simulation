@@ -215,8 +215,6 @@ GET http://{robot_ip}/api/control?action={action}&speed={speed}[&time={ms}]
 |------|-------------|
 | `voiceCommandRobot.py` | Main program (latest version with streaming ASR, timing logs, 10s max segment) |
 | `voiceCommandRobot_v5.py` | Alternative version with similar features |
-| `voiceCommandRobot_simulation_test.py` | Simulation test version |
-| `voiceCommandRobot_simulation_test_2.py` | Extended simulation test version |
 
 ## Architecture
 
