@@ -1411,11 +1411,8 @@ def send_robot_command_async(robot_ip: str, action: str, speed: int,
             except Exception:
                 pass
 
-    if is_stop:
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-    else:
-        _worker()
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
 
 
 def write_log(text: str, filepath: str):
@@ -1766,6 +1763,8 @@ class VoiceRobot:
         self._stream_result = [None]
         self._last_stream_frames = 0
         self._stream_displayed = False
+        self._last_command_time = 0.0
+        self._command_cooldown = 2.0
 
     def _log(self, msg, file=None, flush=True):
         if not self.quiet:
@@ -1997,7 +1996,7 @@ class VoiceRobot:
                     pass
         self._log("[Recorder] Stopped.")
 
-    def _dispatch_command(self, text: str, action: str = None):
+    def _dispatch_command(self, text: str, action: str = None, printout_time: float = None):
         if action is None:
             action = understand_command(text)
 
@@ -2094,6 +2093,10 @@ class VoiceRobot:
 
         cmd_info = f"[指令] {label} ({action})" + (f" [{detail}]" if detail else "")
         print(cmd_info, flush=True)
+        exec_time = time.time()
+        if printout_time is not None:
+            printout_to_exec_ms = (exec_time - printout_time) * 1000.0
+            self._log(f"[Timing] CLI printout -> robot execution: {printout_to_exec_ms:.1f}ms")
         self._log(f"[Command] {label} ({action})" + (f" [{detail}]" if detail else ""))
 
         if self.robot_ip:
@@ -2352,13 +2355,14 @@ class VoiceRobot:
 
         return text
 
-    def _process_segment(self, speech_segment, output_history):
+    def _process_segment(self, speech_segment, output_history, voice_accept_time=None):
+        if voice_accept_time is None:
+            voice_accept_time = time.time()
         audio_full = np.concatenate(speech_segment)
         min_samples = int(self.sample_rate * 0.2)  # Min 200ms to avoid processing noise
         audio_duration = len(audio_full) / self.sample_rate
 
         if len(audio_full) < min_samples:
-            self._log(f"[ASR] Skipped: too short ({audio_duration:.2f}s < 0.2s)", file=sys.stderr)
             return
 
 
@@ -2396,21 +2400,17 @@ class VoiceRobot:
             break
 
         if not text:
-            self._log("[ASR] Empty result from model", file=sys.stderr)
             return
 
         text = clean_asr_text(text)
         if not text:
-            self._log("[ASR] Empty after cleaning tokens", file=sys.stderr)
             return
 
         if is_hallucination(text):
-            self._log(f"[ASR] Skipped hallucination: '{text}'", file=sys.stderr)
             return
 
         text = remove_internal_repeats(text).strip()
         if not text:
-            self._log("[ASR] Empty after removing repeats", file=sys.stderr)
             return
 
         # Apply ASR error corrections
@@ -2419,12 +2419,11 @@ class VoiceRobot:
             self._log(f"[ASR] Corrected '{text}' -> '{corrected}'", file=sys.stderr)
             text = corrected
 
-        # Shorter duplicate window to allow legitimate repeated commands
+        # Duplicate suppression window (10s to cover robot retry delays)
         for old_text, old_time in output_history:
-            if time.time() - old_time > 5.0:  # Reduced from 10s to 5s
+            if time.time() - old_time > 10.0:
                 continue
             if is_duplicate(text, old_text):
-                self._log(f"[ASR] Skipped duplicate: '{text}'", file=sys.stderr)
                 return
 
         output_history.append((text, time.time()))
@@ -2465,7 +2464,10 @@ class VoiceRobot:
             self._last_activity_time = time.time()
             return
 
+        printout_time = time.time()
+        accept_to_print_ms = (printout_time - voice_accept_time) * 1000.0
         print(f">>> {text}  [指令: {cmd_text}]", flush=True)
+        self._log(f"[Timing] Voice accept -> CLI printout: {accept_to_print_ms:.1f}ms")
         text = cmd_text
 
         # Check idle timeout
@@ -2488,7 +2490,8 @@ class VoiceRobot:
             return
 
         self._last_activity_time = time.time()
-        self._dispatch_command(text, action)
+        self._last_command_time = time.time()
+        self._dispatch_command(text, action, printout_time=printout_time)
 
     def run(self):
         self._log("=" * 55)
@@ -2497,7 +2500,7 @@ class VoiceRobot:
         self._log(f"  Audio device : {self.device}")
         self._log(f"  Sample rate  : {self.sample_rate} Hz")
         self._log(f"  Delay        : {self.delay_seconds}s")
-        self._log(f"  VAD          : split @ ~0.6s silence, max segment 20s (long commands supported)")
+        self._log(f"  VAD          : split @ ~0.6s silence, max segment 10s (long commands supported)")
         if self.robot_ip:
             self._log(f"  Robot IP     : {self.robot_ip}")
             self._log(f"  Speed        : {self.robot_speed} (API: {max(0, min(50, self.robot_speed // 2))})")
@@ -2568,8 +2571,8 @@ class VoiceRobot:
         frame_bytes = frame_size * SAMPLE_WIDTH
 
         # Maximum length of a single speech segment (seconds). Long commands
-        # may take several seconds to speak, so allow up to 20s as a safety cap.
-        max_segment_seconds = 20.0
+        # may take several seconds to speak, so allow up to 10s as a safety cap.
+        max_segment_seconds = 10.0
         max_segment_frames = int(self.sample_rate * max_segment_seconds / frame_size)
 
         # End-of-utterance silence threshold. Reduced from 19 to 14 (~450ms)
@@ -2671,7 +2674,6 @@ class VoiceRobot:
         no_growth_count = 0
         self._running = True
         loop_counter = 0
-        last_command_time = 0
 
         try:
             while self._running:
@@ -2803,8 +2805,20 @@ class VoiceRobot:
                             if self._stream_thread is not None and self._stream_thread.is_alive():
                                 self._stream_thread.join(timeout=0.5)
 
-                            print("📝 [识别中...]", flush=True)
-                            self._process_segment(speech_segment, output_history)
+                            # Skip if within command cooldown (prevents echo/repeat loops)
+                            if time.time() - self._last_command_time < self._command_cooldown:
+                                speech_segment = []
+                                in_speech = False
+                                consec_voiced = 0
+                                voiced_total = 0
+                                silence_frames = 0
+                                pre_roll = []
+                                self._last_stream_frames = 0
+                                self._stream_displayed = False
+                                continue
+
+                            voice_accept_time = time.time()
+                            self._process_segment(speech_segment, output_history, voice_accept_time=voice_accept_time)
                         else:
                             # Suppress dropped segment log to keep command line clean
                             pass

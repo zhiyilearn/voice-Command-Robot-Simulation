@@ -1385,19 +1385,19 @@ def send_robot_command_async(robot_ip: str, action: str, speed: int,
                 last_error = f"URL Error: {e.reason}"
                 if log_func is not None:
                     log_func(f"[Robot] Retry {attempt+1}/{retries} for {action}: {last_error}", file=sys.stderr)
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(0.2 * (attempt + 1))  # Reduced from 0.5 for lower latency
             except urllib.error.HTTPError as e:
                 last_error = f"HTTP {e.code}"
                 if e.code == 404:
                     break  # Don't retry on 404
                 if log_func is not None:
                     log_func(f"[Robot] Retry {attempt+1}/{retries} for {action}: {last_error}", file=sys.stderr)
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(0.2 * (attempt + 1))  # Reduced from 0.5 for lower latency
             except Exception as e:
                 last_error = str(e)
                 if log_func is not None:
                     log_func(f"[Robot] Retry {attempt+1}/{retries} for {action}: {last_error}", file=sys.stderr)
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(0.2 * (attempt + 1))  # Reduced from 0.5 for lower latency
 
         status = "OK" if ok else "FAIL"
         detail_str = f" [{detail}]" if detail else ""
@@ -1411,11 +1411,8 @@ def send_robot_command_async(robot_ip: str, action: str, speed: int,
             except Exception:
                 pass
 
-    if is_stop:
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
-    else:
-        _worker()
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
 
 
 def write_log(text: str, filepath: str):
@@ -1759,6 +1756,16 @@ class VoiceRobot:
         self._sequence_running = False
         self._sequence_stop_requested = False
 
+        # Streaming ASR state
+        self._no_streaming = getattr(args, 'no_streaming', False)
+        self._stream_interval = 1.0
+        self._stream_thread = None
+        self._stream_result = [None]
+        self._last_stream_frames = 0
+        self._stream_displayed = False
+        self._last_command_time = 0.0
+        self._command_cooldown = 2.0
+
     def _log(self, msg, file=None, flush=True):
         if not self.quiet:
             print(msg, file=file, flush=flush)
@@ -1989,7 +1996,7 @@ class VoiceRobot:
                     pass
         self._log("[Recorder] Stopped.")
 
-    def _dispatch_command(self, text: str, action: str = None):
+    def _dispatch_command(self, text: str, action: str = None, printout_time: float = None):
         if action is None:
             action = understand_command(text)
 
@@ -2084,6 +2091,12 @@ class VoiceRobot:
             detail_parts.append(f"speed={params['speed']}")
         detail = ", ".join(detail_parts)
 
+        cmd_info = f"[指令] {label} ({action})" + (f" [{detail}]" if detail else "")
+        print(cmd_info, flush=True)
+        exec_time = time.time()
+        if printout_time is not None:
+            printout_to_exec_ms = (exec_time - printout_time) * 1000.0
+            self._log(f"[Timing] CLI printout -> robot execution: {printout_to_exec_ms:.1f}ms")
         self._log(f"[Command] {label} ({action})" + (f" [{detail}]" if detail else ""))
 
         if self.robot_ip:
@@ -2103,7 +2116,7 @@ class VoiceRobot:
                     except Exception as e:
                         self._log(f"[Robot] STOP attempt {i+1} failed: {e}", file=sys.stderr)
                     if i < 2:
-                        time.sleep(0.05)
+                        time.sleep(0.02)  # Reduced from 0.05 for lower latency
                 self._log(f"[Robot] {label} ({action}) -> OK")
                 self._needs_wakeup = True
             else:
@@ -2117,7 +2130,8 @@ class VoiceRobot:
                         output_file=None, text="",
                         is_stop=True,
                     )
-                    time.sleep(0.1)
+                    # Reduced from 0.1s to 0.01s for lower latency
+                    time.sleep(0.01)
                 # Always send stop first to ensure clean state before new movement
                 send_robot_command_async(
                     self.robot_ip, "stop", params["speed"], None,
@@ -2125,7 +2139,8 @@ class VoiceRobot:
                     output_file=None, text="",
                     is_stop=True,
                 )
-                time.sleep(0.05)
+                # Reduced from 0.05s to 0.01s for lower latency
+                time.sleep(0.01)
                 send_robot_command_async(
                     self.robot_ip, action, params["speed"], dur,
                     log_func=self._log, label=label, detail=detail,
@@ -2299,16 +2314,58 @@ class VoiceRobot:
                     time.sleep(0.1)
         return False
 
-    def _process_segment(self, speech_segment, output_history):
+    def _process_streaming_segment(self, speech_segment):
+        """Run ASR on accumulated audio for interim display. No command execution."""
+        if not speech_segment:
+            return None
+        audio_full = np.concatenate(speech_segment)
+        min_samples = int(self.sample_rate * 0.3)
+        if len(audio_full) < min_samples:
+            return None
+
+        result = [None]
+        def _do_generate():
+            try:
+                result[0] = self._model.generate(audio_full)
+            except Exception as e:
+                result[0] = e
+
+        t_gen = threading.Thread(target=_do_generate, daemon=True)
+        t_gen.start()
+        t_gen.join(timeout=3.0)
+
+        if t_gen.is_alive() or isinstance(result[0], Exception):
+            return None
+
+        text = result[0][0].get('text', '').strip() if result[0] and len(result[0]) > 0 else ""
+        if not text:
+            return None
+
+        text = clean_asr_text(text)
+        if not text or is_hallucination(text):
+            return None
+
+        text = remove_internal_repeats(text).strip()
+        if not text:
+            return None
+
+        corrected = correct_asr_errors(text)
+        if corrected != text:
+            text = corrected
+
+        return text
+
+    def _process_segment(self, speech_segment, output_history, voice_accept_time=None):
+        if voice_accept_time is None:
+            voice_accept_time = time.time()
         audio_full = np.concatenate(speech_segment)
         min_samples = int(self.sample_rate * 0.2)  # Min 200ms to avoid processing noise
         audio_duration = len(audio_full) / self.sample_rate
 
         if len(audio_full) < min_samples:
-            self._log(f"[ASR] Skipped: too short ({audio_duration:.2f}s < 0.2s)", file=sys.stderr)
             return
 
-        self._log(f"[ASR] Processing {audio_duration:.2f}s segment...", file=sys.stderr)
+
 
         # Try ASR with retry on timeout/error
         max_retries = 2
@@ -2343,21 +2400,17 @@ class VoiceRobot:
             break
 
         if not text:
-            self._log("[ASR] Empty result from model", file=sys.stderr)
             return
 
         text = clean_asr_text(text)
         if not text:
-            self._log("[ASR] Empty after cleaning tokens", file=sys.stderr)
             return
 
         if is_hallucination(text):
-            self._log(f"[ASR] Skipped hallucination: '{text}'", file=sys.stderr)
             return
 
         text = remove_internal_repeats(text).strip()
         if not text:
-            self._log("[ASR] Empty after removing repeats", file=sys.stderr)
             return
 
         # Apply ASR error corrections
@@ -2366,12 +2419,11 @@ class VoiceRobot:
             self._log(f"[ASR] Corrected '{text}' -> '{corrected}'", file=sys.stderr)
             text = corrected
 
-        # Shorter duplicate window to allow legitimate repeated commands
+        # Duplicate suppression window (10s to cover robot retry delays)
         for old_text, old_time in output_history:
-            if time.time() - old_time > 5.0:  # Reduced from 10s to 5s
+            if time.time() - old_time > 10.0:
                 continue
             if is_duplicate(text, old_text):
-                self._log(f"[ASR] Skipped duplicate: '{text}'", file=sys.stderr)
                 return
 
         output_history.append((text, time.time()))
@@ -2412,7 +2464,10 @@ class VoiceRobot:
             self._last_activity_time = time.time()
             return
 
+        printout_time = time.time()
+        accept_to_print_ms = (printout_time - voice_accept_time) * 1000.0
         print(f">>> {text}  [指令: {cmd_text}]", flush=True)
+        self._log(f"[Timing] Voice accept -> CLI printout: {accept_to_print_ms:.1f}ms")
         text = cmd_text
 
         # Check idle timeout
@@ -2435,7 +2490,8 @@ class VoiceRobot:
             return
 
         self._last_activity_time = time.time()
-        self._dispatch_command(text, action)
+        self._last_command_time = time.time()
+        self._dispatch_command(text, action, printout_time=printout_time)
 
     def run(self):
         self._log("=" * 55)
@@ -2444,7 +2500,7 @@ class VoiceRobot:
         self._log(f"  Audio device : {self.device}")
         self._log(f"  Sample rate  : {self.sample_rate} Hz")
         self._log(f"  Delay        : {self.delay_seconds}s")
-        self._log(f"  VAD          : split @ ~0.6s silence, max segment 20s (long commands supported)")
+        self._log(f"  VAD          : split @ ~0.6s silence, max segment 10s (long commands supported)")
         if self.robot_ip:
             self._log(f"  Robot IP     : {self.robot_ip}")
             self._log(f"  Speed        : {self.robot_speed} (API: {max(0, min(50, self.robot_speed // 2))})")
@@ -2506,7 +2562,7 @@ class VoiceRobot:
                 self._log(f"[Robot] WARNING: Cannot connect to {self.robot_ip}, commands may fail! ({last_err})", file=sys.stderr)
 
         bytes_per_sec = self.sample_rate * SAMPLE_WIDTH
-        buffer_delay = min(self.delay_seconds, 0.1)
+        buffer_delay = min(self.delay_seconds, 0.03)  # Cap at 30ms for low latency
         delay_bytes = int(bytes_per_sec * buffer_delay)
 
         # --- VAD (Voice Activity Detection) parameters ---
@@ -2515,34 +2571,30 @@ class VoiceRobot:
         frame_bytes = frame_size * SAMPLE_WIDTH
 
         # Maximum length of a single speech segment (seconds). Long commands
-        # may take several seconds to speak, so allow up to 20s as a safety cap.
-        max_segment_seconds = 20.0
+        # may take several seconds to speak, so allow up to 10s as a safety cap.
+        max_segment_seconds = 10.0
         max_segment_frames = int(self.sample_rate * max_segment_seconds / frame_size)
 
-        # End-of-utterance silence threshold. A natural pause *within* a
-        # sentence is typically 200-400ms, while a pause that marks the end of
-        # a command (or the boundary between sequential sub-commands such as
-        # "向前走2米 … 再向左转90度") is usually 500ms+. We use ~0.6s (19
-        # frames) so mid-sentence pauses do NOT split a single command, while
-        # genuine command boundaries are detected and split naturally.
-        # Increased from 16 to 19 to better handle natural speech rhythm.
-        silence_frames_threshold = 19
+        # End-of-utterance silence threshold. Reduced from 19 to 14 (~450ms)
+        # for faster command execution. Still longer than natural mid-sentence
+        # pauses (200-400ms) so commands are not split.
+        silence_frames_threshold = 14
 
         # Number of consecutive voiced frames required before speech is
         # considered to have started (filters out brief clicks / noise).
-        # Reduced from 2 to 1 to catch speech start faster.
         vad_start_frames = 1
 
         # Pre-roll: keep this many recent frames in a ring buffer so that when
         # speech is detected we can prepend them and avoid clipping the first
-        # syllable of the utterance. Increased from 6 to 10 (~320ms).
-        pre_roll_frames = 10
+        # syllable of the utterance. Reduced from 10 to 6 (~192ms) for lower latency.
+        pre_roll_frames = 6
 
         # Minimum number of voiced frames required to actually run ASR on a
-        # captured segment. Reduced from 3 to 2 to catch shorter utterances.
+        # captured segment. Reduced from 2 to 2 (kept).
         min_voiced_frames = 2
 
         command_cooldown = 1.0
+        stream_interval_frames = int(self.sample_rate * self._stream_interval / frame_size)
 
         buffer_wait_timeout = 10.0
         buffer_wait_start = time.time()
@@ -2593,8 +2645,7 @@ class VoiceRobot:
                     if file_size >= delay_bytes:
                         buffer_ready = True
                         break
-                    if file_size > 0:
-                        self._log(f"[Recorder] Buffer filling... {file_size}/{delay_bytes} bytes", file=sys.stderr)
+                    # Suppress "Buffer filling" log to keep command line clean
                 except OSError:
                     pass
             
@@ -2604,7 +2655,7 @@ class VoiceRobot:
             self._log("[ASR] Cannot start listening - audio buffer not ready", file=sys.stderr)
             return
 
-        self._log("[ASR] Listening...")
+        print("[ASR] Listening...", flush=True)
 
         if self._auto_start_camera and self.robot_ip:
             self._handle_camera_command("camera_on", "")
@@ -2623,15 +2674,12 @@ class VoiceRobot:
         no_growth_count = 0
         self._running = True
         loop_counter = 0
-        last_command_time = 0
 
         try:
             while self._running:
                 try:
                     loop_counter += 1
-                    if loop_counter >= 100:
-                        loop_counter = 0
-                        self._log("[ASR] heartbeat")
+                    # Heartbeat removed to keep command line clean
 
                     file_size = os.path.getsize(PCM_FILE)
                 except OSError:
@@ -2693,6 +2741,9 @@ class VoiceRobot:
                                 speech_segment = list(pre_roll)
                                 voiced_total = consec_voiced
                                 silence_frames = 0
+                                self._last_stream_frames = 0
+                                self._stream_displayed = False
+                                print("🎤 [语音检测...]", flush=True)
                         else:
                             consec_voiced = 0
                         continue
@@ -2715,14 +2766,62 @@ class VoiceRobot:
                     #   * the safety cap on segment length is hit.
                     segment_ready = (silence_frames >= silence_frames_threshold
                                      or len(speech_segment) >= max_segment_frames)
+
+                    # --- Streaming ASR during ongoing speech ---
+                    if not self._no_streaming and not segment_ready:
+                        frames_since_stream = len(speech_segment) - self._last_stream_frames
+                        if frames_since_stream >= stream_interval_frames:
+                            if self._stream_thread is None or not self._stream_thread.is_alive():
+                                seg_copy = list(speech_segment)
+                                self._stream_result = [None]
+                                def _do_stream():
+                                    self._stream_result[0] = self._process_streaming_segment(seg_copy)
+                                self._stream_thread = threading.Thread(target=_do_stream, daemon=True)
+                                self._stream_thread.start()
+                                self._last_stream_frames = len(speech_segment)
+
+                        # Check if streaming result is ready
+                        if self._stream_thread is not None and not self._stream_thread.is_alive():
+                            stext = self._stream_result[0]
+                            if stext:
+                                pad = 80
+                                line = f"\r>>> {stext}  [听写中...]"
+                                sys.stdout.write(line.ljust(pad))
+                                sys.stdout.flush()
+                                self._stream_displayed = True
+                            self._stream_thread = None
+
                     if segment_ready:
                         # Only run ASR when the segment held meaningful speech;
                         # otherwise discard the captured noise.
                         if voiced_total >= min_voiced_frames:
-                            self._process_segment(speech_segment, output_history)
+                            # Clear any streaming display line before final output
+                            if self._stream_displayed:
+                                sys.stdout.write("\r" + " " * 80 + "\r")
+                                sys.stdout.flush()
+                                self._stream_displayed = False
+
+                            # Briefly wait for any ongoing streaming ASR to avoid model contention
+                            if self._stream_thread is not None and self._stream_thread.is_alive():
+                                self._stream_thread.join(timeout=0.5)
+
+                            # Skip if within command cooldown (prevents echo/repeat loops)
+                            if time.time() - self._last_command_time < self._command_cooldown:
+                                speech_segment = []
+                                in_speech = False
+                                consec_voiced = 0
+                                voiced_total = 0
+                                silence_frames = 0
+                                pre_roll = []
+                                self._last_stream_frames = 0
+                                self._stream_displayed = False
+                                continue
+
+                            voice_accept_time = time.time()
+                            self._process_segment(speech_segment, output_history, voice_accept_time=voice_accept_time)
                         else:
-                            self._log(f"[VAD] Dropped segment: only {voiced_total} voiced frames",
-                                      file=sys.stderr)
+                            # Suppress dropped segment log to keep command line clean
+                            pass
                         # Reset state for the next utterance.
                         speech_segment = []
                         in_speech = False
@@ -2730,6 +2829,8 @@ class VoiceRobot:
                         voiced_total = 0
                         silence_frames = 0
                         pre_roll = []
+                        self._last_stream_frames = 0
+                        self._stream_displayed = False
 
         except KeyboardInterrupt:
             self._log("\nStopping...")
@@ -2808,8 +2909,8 @@ def main():
                         help="Seconds to turn 90° right at speed=50 (falls back to --turn-factor)")
     parser.add_argument("--default-turn-duration", type=float, default=1.0,
                         help="Default duration for simple turns without angle (default: 1.0s)")
-    parser.add_argument("--delay", type=float, default=0.1,
-                        help="Recorder→transcriber delay in seconds (default: 0.1, optimized)")
+    parser.add_argument("--delay", type=float, default=0.02,
+                        help="Recorder→transcriber delay in seconds (default: 0.02, optimized for low latency)")
     parser.add_argument("--threshold", type=float, default=0.003,
                         help="VAD RMS threshold (default: 0.003, lower = more sensitive)")
     parser.add_argument("--gain", type=float, default=1.0,
@@ -2834,6 +2935,8 @@ def main():
                         help="Enable wake-word mode (system sleeps until wake word detected)")
     parser.add_argument("--idle-timeout", type=float, default=30.0,
                         help="Idle timeout in seconds before auto-sleep (default: 30, requires --wake-word)")
+    parser.add_argument("--no-streaming", action="store_true",
+                        help="Disable real-time streaming ASR display")
 
     args = parser.parse_args()
 
