@@ -1770,28 +1770,244 @@ class VoiceRobot:
         if not self.quiet:
             print(msg, file=file, flush=flush)
 
+    @staticmethod
+    def _get_possible_homes():
+        """Return a list of possible home directories to search.
+
+        This handles cases where the model was downloaded by a different user
+        (e.g., root vs regular user, or via sudo).
+        """
+        homes = set()
+
+        # Current user home
+        home = os.path.expanduser("~")
+        if home and home != "~":
+            homes.add(home)
+
+        # HOME env var
+        env_home = os.environ.get("HOME")
+        if env_home:
+            homes.add(env_home)
+
+        # SUDO_USER's home
+        sudo_user = os.environ.get("SUDO_USER")
+        if sudo_user:
+            import pwd
+            try:
+                homes.add(pwd.getpwnam(sudo_user).pw_dir)
+            except Exception:
+                pass
+
+        # LOGNAME / USER
+        for env_key in ("LOGNAME", "USER"):
+            u = os.environ.get(env_key)
+            if u:
+                import pwd
+                try:
+                    homes.add(pwd.getpwnam(u).pw_dir)
+                except Exception:
+                    pass
+
+        # getpwuid for current process
+        try:
+            import pwd
+            homes.add(pwd.getpwuid(os.getuid()).pw_dir)
+        except Exception:
+            pass
+
+        # Common absolute fallback paths
+        homes.add("/root")
+        homes.add("/home/" + os.environ.get("USER", "user"))
+
+        return sorted(homes)
+
     def _find_local_model(self):
+        """Search the local cache directories for an existing SenseVoice model.
+
+        Search order:
+        1. Environment variable SENSEVOICE_MODEL_PATH
+        2. User-supplied --model-dir
+        3. ModelScope cache under every known home directory
+        4. HuggingFace cache under every known home directory
+        5. Legacy ~/.cache/sensevoice/ under every known home directory
+
+        Returns the path to the first non-empty model directory, or None.
+        """
+        # Use plain print for diagnostics so it is never suppressed by --quiet.
+        def _diag(msg):
+            print(msg, file=sys.stderr, flush=True)
+
+        _diag("[Model] Searching for local SenseVoice model...")
+
+        # 0. Environment variable override
+        env_path = os.environ.get("SENSEVOICE_MODEL_PATH")
+        if env_path and os.path.isdir(env_path) and len(os.listdir(env_path)) > 0:
+            _diag(f"[Model] Found via SENSEVOICE_MODEL_PATH: {env_path}")
+            return env_path
+
+        # 1. User-supplied --model-dir
         if self.model_dir and os.path.exists(self.model_dir):
             if len(os.listdir(self.model_dir)) > 0:
+                _diag(f"[Model] Found --model-dir: {self.model_dir}")
                 return self.model_dir
-            self._log(f"[Model] Model dir exists but is empty: {self.model_dir}", file=sys.stderr)
-            return None
+            _diag(f"[Model] --model-dir exists but is empty: {self.model_dir}")
 
-        ms_cache_base = os.path.expanduser("~/.cache/modelscope/hub/models/iic")
-        if os.path.exists(ms_cache_base):
-            for name in os.listdir(ms_cache_base):
-                if name.lower().startswith("sensevoice"):
-                    full_path = os.path.join(ms_cache_base, name)
-                    if len(os.listdir(full_path)) > 0:
-                        return full_path
-                    self._log(f"[Model] Model dir exists but empty: {full_path}", file=sys.stderr)
+        # Collect every home directory we might care about
+        homes = self._get_possible_homes()
+        _diag(f"[Model] Will search under home dirs: {homes}")
 
-        cache_dir = os.path.expanduser("~/.cache/sensevoice")
-        if os.path.exists(cache_dir):
-            for name in os.listdir(cache_dir):
-                p = os.path.join(cache_dir, name)
-                if os.path.isdir(p) and len(os.listdir(p)) > 0:
-                    return p
+        # 2. ModelScope cache - check under every home directory
+        ms_rel_paths = [
+            ".cache/modelscope/iic",
+            ".cache/modelscope/hub/models/iic",
+            ".cache/modelscope/models/iic",
+            ".cache/modelscope/hub/iic",
+            ".cache/modelscope/hub",
+        ]
+        for home in homes:
+            for rel in ms_rel_paths:
+                base = os.path.join(home, rel)
+                if not os.path.isdir(base):
+                    continue
+                _diag(f"[Model] Checking ModelScope cache: {base}")
+                try:
+                    names = os.listdir(base)
+                except OSError as e:
+                    _diag(f"[Model] Cannot list {base}: {e}")
+                    continue
+                for name in sorted(names):
+                    if "sensevoice" not in name.lower():
+                        continue
+                    full_path = os.path.join(base, name)
+                    if not os.path.isdir(full_path):
+                        continue
+                    try:
+                        contents = os.listdir(full_path)
+                    except OSError:
+                        continue
+                    if len(contents) == 0:
+                        _diag(f"[Model] Cache dir empty: {full_path}")
+                        continue
+                    # Check snapshots subdir
+                    snapshots_dir = os.path.join(full_path, "snapshots")
+                    if os.path.isdir(snapshots_dir):
+                        try:
+                            for snap in os.listdir(snapshots_dir):
+                                snap_path = os.path.join(snapshots_dir, snap)
+                                if os.path.isdir(snap_path) and len(os.listdir(snap_path)) > 0:
+                                    _diag(f"[Model] Found in snapshots: {snap_path}")
+                                    return snap_path
+                        except OSError:
+                            pass
+                    _diag(f"[Model] Found ModelScope cache: {full_path}")
+                    return full_path
+
+        # 3. HuggingFace hub cache
+        for home in homes:
+            hf_base = os.path.join(home, ".cache/huggingface/hub")
+            if not os.path.isdir(hf_base):
+                continue
+            _diag(f"[Model] Checking HuggingFace cache: {hf_base}")
+            try:
+                names = os.listdir(hf_base)
+            except OSError:
+                continue
+            for name in sorted(names):
+                if "sensevoice" not in name.lower():
+                    continue
+                snapshots_dir = os.path.join(hf_base, name, "snapshots")
+                if os.path.isdir(snapshots_dir):
+                    try:
+                        for snap in os.listdir(snapshots_dir):
+                            snap_path = os.path.join(snapshots_dir, snap)
+                            if os.path.isdir(snap_path) and len(os.listdir(snap_path)) > 0:
+                                _diag(f"[Model] Found HuggingFace cache: {snap_path}")
+                                return snap_path
+                    except OSError:
+                        pass
+                full_path = os.path.join(hf_base, name)
+                if os.path.isdir(full_path) and len(os.listdir(full_path)) > 0:
+                    _diag(f"[Model] Found HuggingFace: {full_path}")
+                    return full_path
+
+        # 4. Legacy ~/.cache/sensevoice/
+        for home in homes:
+            cache_dir = os.path.join(home, ".cache/sensevoice")
+            if not os.path.isdir(cache_dir):
+                continue
+            _diag(f"[Model] Checking legacy cache: {cache_dir}")
+            try:
+                for name in os.listdir(cache_dir):
+                    p = os.path.join(cache_dir, name)
+                    if os.path.isdir(p) and len(os.listdir(p)) > 0:
+                        _diag(f"[Model] Found legacy cache: {p}")
+                        return p
+            except OSError:
+                continue
+
+        # 5. Final diagnostic walk under every home's .cache/modelscope
+        for home in homes:
+            ms_base = os.path.join(home, ".cache/modelscope")
+            if not os.path.isdir(ms_base):
+                _diag(f"[Model] ModelScope cache root does not exist: {ms_base}")
+                continue
+            _diag(f"[Model] ModelScope cache root exists: {ms_base}")
+            try:
+                for root, dirs, files in os.walk(ms_base):
+                    for d in dirs:
+                        if "sensevoice" in d.lower():
+                            p = os.path.join(root, d)
+                            _diag(f"[Model] Found sensevoice dir during walk: {p}")
+            except OSError as e:
+                _diag(f"[Model] Cannot walk {ms_base}: {e}")
+
+        _diag("[Model] No local SenseVoice model found in any search path.")
+        return None
+
+    def _download_model(self):
+        """Download SenseVoiceSmall to the local ModelScope cache directory.
+
+        Returns the local path of the downloaded model.
+        """
+        from funasr import AutoModel
+
+        # Ensure cache directory exists
+        cache_root = os.path.expanduser("~/.cache/modelscope/hub/models/iic")
+        os.makedirs(cache_root, exist_ok=True)
+
+        self._log("[Model] No local cache found, downloading iic/SenseVoiceSmall ...")
+        try:
+            # First call triggers download to ModelScope cache
+            self._model = AutoModel(
+                model="iic/SenseVoiceSmall",
+                model_type="asr",
+                use_onnx=True,
+                disable_pbar=True,
+                disable_update=True,
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to download SenseVoiceSmall from ModelScope: {e}\n"
+                "Check your network connection and try again.\n"
+                "Manual download: python3 -c \"from funasr import AutoModel; "
+                "AutoModel(model='iic/SenseVoiceSmall', use_onnx=True)\""
+            )
+
+        # After download, locate the model on disk and confirm it is cached locally
+        local_path = self._find_local_model()
+        if local_path:
+            self._log(f"[Model] Downloaded and cached at: {local_path}")
+            return local_path
+
+        # Fallback: use the default ModelScope cache path even if we cannot enumerate it
+        fallback = os.path.join(cache_root, "SenseVoiceSmall")
+        if os.path.isdir(fallback) and len(os.listdir(fallback)) > 0:
+            self._log(f"[Model] Cached at: {fallback}")
+            return fallback
+
+        # Last-resort: keep the in-memory model but warn that path lookup failed
+        self._log("[Model] WARNING: download succeeded but cache path not found on disk.", file=sys.stderr)
         return None
 
     def _load_model(self):
@@ -1807,7 +2023,7 @@ class VoiceRobot:
             if hasattr(torch.backends, 'onednn'):
                 torch.backends.onednn.enabled = False
             torch.set_num_threads(4)
-            from funasr import AutoModel
+            from funasr import AutoModel  # noqa: F401  (ensure import)
         except ImportError:
             raise RuntimeError(
                 "funasr not installed. Run: pip install funasr\n"
@@ -1815,28 +2031,54 @@ class VoiceRobot:
                 "AutoModel(model='iic/SenseVoiceSmall', use_onnx=True)\""
             )
 
+        # Step 1: always look in the local cache first
         local_path = self._find_local_model()
-        if not local_path:
-            raise RuntimeError(
-                "No local SenseVoice model found!\n"
-                "Checked: ~/.cache/modelscope/hub/models/iic/SenseVoiceSmall\n"
-                "         ~/.cache/sensevoice/\n"
-                "Use --model-dir /path/to/model or download first."
-            )
 
-        self._log(f"[Model] Using: {local_path}")
-        try:
-            self._model = AutoModel(
-                model=local_path,
-                model_type="asr",
-                use_onnx=True,
-                disable_pbar=True,
-                disable_update=True,
-                trust_remote_code=True,
-            )
-            self._log("[Model] Loaded.")
-        except Exception as e:
-            raise RuntimeError(f"Failed to load model: {e}")
+        if local_path:
+            self._log(f"[Model] Found local cache: {local_path}")
+            try:
+                self._model = AutoModel(
+                    model=local_path,
+                    model_type="asr",
+                    use_onnx=True,
+                    disable_pbar=True,
+                    disable_update=True,
+                    trust_remote_code=True,
+                )
+                self._log("[Model] Loaded from local cache.")
+                return
+            except Exception as e:
+                self._log(f"[Model] Failed to load local model ({e}), will re-download.", file=sys.stderr)
+                # If the local cache is corrupted, fall through to re-download
+
+        # Step 2: local cache missing or unusable — download to local cache
+        local_path = self._download_model()
+        if local_path:
+            try:
+                self._model = AutoModel(
+                    model=local_path,
+                    model_type="asr",
+                    use_onnx=True,
+                    disable_pbar=True,
+                    disable_update=True,
+                    trust_remote_code=True,
+                )
+                self._log("[Model] Loaded from freshly cached model.")
+                return
+            except Exception as e:
+                raise RuntimeError(f"Failed to load freshly cached model: {e}")
+
+        # If we reach here, _download_model() already set self._model in-memory.
+        # No on-disk path to report; just log success.
+        if self._model is not None:
+            self._log("[Model] Loaded (in-memory, no on-disk cache path).")
+            return
+
+        raise RuntimeError(
+            "Failed to load SenseVoiceSmall model.\n"
+            "Checked local cache: ~/.cache/modelscope/, ~/.cache/huggingface/, ~/.cache/sensevoice/\n"
+            "Network download also failed. Check your connection and try again."
+        )
 
         if not getattr(self, 'no_warmup', False):
             self._log("[Model] Warming up...")
